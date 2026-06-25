@@ -25,7 +25,8 @@ flowchart LR
 
     BC -- "send_message" --> BS
     BS -- "INSERT message" --> DB
-    DB -- "poll undelivered" --> FS
+    BS -. "touch wake file" .-> FS
+    DB -- "read undelivered" --> FS
     FS -- "&lt;channel&gt; push" --> FC
     FS -. "mark delivered" .-> DB
 
@@ -109,20 +110,23 @@ To reply, call `send_message` with `to` set to the `from` value.
 - **Discovery** — each session upserts a row in `peers` and refreshes `last_seen`
   every 15s. A peer silent for 45s is treated as offline and reaped.
 - **Delivery** — `send_message` does an `INSERT` into `messages` (`delivered_at`
-  NULL). The recipient's server polls every 500 ms for its undelivered rows,
+  NULL) and **touches the recipient's wake file**. The recipient `fs.watch`es
+  that file and drains the instant it changes: it reads its undelivered rows,
   pushes each into its session via the channels API, then sets `delivered_at`
   (so a row is marked delivered **only after** a successful push — never lost,
-  never double-counted).
+  never double-counted). A 3 s poll runs as a safety net.
 - **Audit** — `delivered_at IS NULL` is pending, a timestamp means delivered
   ("gone"). `bash scripts/doctor.sh` shows pending/delivered counts per peer.
 - **Offline mailbox** — a row sits undelivered until the recipient is online, so
   you can message a peer that hasn't started yet; it drains on launch.
 
-Why poll rather than push? SQLite can't notify other processes
+Why a wake file? SQLite can't notify other processes
 ([`update_hook` is same-process only](https://sqlite.org/c3ref/update_hook.html)),
-so cross-session delivery is either polling or a separate IPC wake. For
-human-paced messaging a 500 ms poll on an indexed query is the simplest correct
-choice.
+so cross-session delivery needs an external trigger. A per-peer wake file watched
+with `fs.watch` (backed by `kqueue`/`inotify`) gives event-driven, near-instant
+push with no daemon, no network, and none of the PID-signal hazards of `SIGUSR1`.
+The wake file carries no data — it's purely a "go look at the DB" nudge — and the
+3 s poll covers the rare missed filesystem event.
 
 ## Data & migrations
 

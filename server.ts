@@ -34,7 +34,7 @@ const DB_PATH = join(ROOT, 'bus.db')
 
 const HEARTBEAT_MS = 15_000 // how often we refresh our presence
 const STALE_MS = 45_000 // a peer silent this long is treated as offline
-const POLL_MS = 500 // how often we check for messages addressed to us
+const POLL_MS = 3_000 // safety-net poll; the primary trigger is the wake-file watch
 const PRUNE_MS = 60_000 // how often to drop old delivered messages
 const DELIVERED_TTL_MS = 24 * 60 * 60 * 1000 // keep delivered rows this long
 
@@ -57,7 +57,9 @@ const isLive = (peer: string) => bus.isLive(peer, STALE_MS)
 function send(to: string, text: string): number {
   if (to === name) throw new Error('cannot send to self')
   if (!isLive(to)) throw new Error(`no live peer named "${to}" (try list_peers)`)
-  return bus.enqueue(name, to, text)
+  const id = bus.enqueue(name, to, text)
+  bus.wake(to) // push: nudge the recipient to drain now
+  return id
 }
 
 // --- MCP server + tools ------------------------------------------------------
@@ -192,22 +194,31 @@ async function drain(): Promise<void> {
   }
 }
 
+// the wake-file watch is the primary trigger; rebind it whenever our name changes
+let wakeWatcher: ReturnType<typeof bus.watchInbox> | undefined
+function watchInbox(): void {
+  wakeWatcher?.close()
+  wakeWatcher = bus.watchInbox(name, () => void drain())
+}
+
 function rename(next: string): void {
   bus.reassignPending(name, next) // move pending rows to the new name
   bus.unregisterPeer(name)
   name = next
   register()
+  watchInbox() // re-point the wake watch at the new name
   void drain()
 }
 
 // --- Lifecycle ---------------------------------------------------------------
 
 register()
+watchInbox() // push: drain the instant a peer touches our wake file
 void drain() // deliver anything queued while we were offline (mailbox semantics)
 bus.prune(DELIVERED_TTL_MS)
 
 const beat = setInterval(heartbeat, HEARTBEAT_MS)
-const poll = setInterval(drain, POLL_MS)
+const poll = setInterval(drain, POLL_MS) // safety net for any missed wake event
 const pruner = setInterval(() => { if (!closed) bus.prune(DELIVERED_TTL_MS) }, PRUNE_MS)
 
 function shutdown(): void {
@@ -216,6 +227,7 @@ function shutdown(): void {
   clearInterval(beat)
   clearInterval(poll)
   clearInterval(pruner)
+  wakeWatcher?.close()
   try { bus.unregisterPeer(name) } catch {}
   try { bus.close() } catch {}
   process.exit(0)

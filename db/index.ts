@@ -7,19 +7,52 @@ import { Database } from 'bun:sqlite'
 import { drizzle } from 'drizzle-orm/bun-sqlite'
 import { migrate } from 'drizzle-orm/bun-sqlite/migrator'
 import { and, asc, eq, gte, isNotNull, isNull, lt } from 'drizzle-orm'
-import { mkdirSync } from 'fs'
+import { mkdirSync, writeFileSync, watch, openSync, closeSync, rmSync } from 'fs'
 import { dirname, join } from 'path'
 import { messages, peers, type Message, type Peer } from './schema'
 
 export type { Message, Peer }
 
+// Serialize cross-process init (the WAL switch + migrations) on a fresh DB with
+// an exclusive lock file, so concurrently-started sessions don't collide.
+function withInitLock(dbPath: string, fn: () => void): void {
+  const lock = `${dbPath}.init.lock`
+  const start = Date.now()
+  for (;;) {
+    let fd: number
+    try {
+      fd = openSync(lock, 'wx') // O_CREAT|O_EXCL — fails if another process holds it
+    } catch {
+      if (Date.now() - start > 20_000) { try { rmSync(lock) } catch {} } // steal a stale lock
+      Bun.sleepSync(25)
+      continue
+    }
+    try { fn() } finally {
+      try { closeSync(fd) } catch {}
+      try { rmSync(lock) } catch {}
+    }
+    return
+  }
+}
+
 export function openBus(dbPath: string) {
   mkdirSync(dirname(dbPath), { recursive: true })
   const sqlite = new Database(dbPath, { create: true })
-  sqlite.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;')
+  sqlite.exec('PRAGMA busy_timeout = 10000;') // per-connection: wait on locks, don't fail
   const db = drizzle({ client: sqlite })
-  // migrations live next to this module, at <repo>/drizzle
-  migrate(db, { migrationsFolder: join(import.meta.dir, '..', 'drizzle') })
+
+  // Only one process sets WAL + runs migrations at a time; the rest wait, then
+  // find WAL already on and migrations already applied (both no-ops).
+  withInitLock(dbPath, () => {
+    sqlite.exec('PRAGMA journal_mode = WAL;')
+    migrate(db, { migrationsFolder: join(import.meta.dir, '..', 'drizzle') })
+  })
+
+  // wake files are zero-byte triggers (not state): touching wake/<peer> nudges
+  // that peer to drain immediately. The DB remains the source of truth.
+  const wakeDir = join(dirname(dbPath), 'wake')
+  mkdirSync(wakeDir, { recursive: true })
+  const wakePath = (n: string) => join(wakeDir, n)
 
   const now = () => Date.now()
 
@@ -70,6 +103,17 @@ export function openBus(dbPath: string) {
     prune(ttlMs: number) {
       db.delete(messages)
         .where(and(isNotNull(messages.deliveredAt), lt(messages.deliveredAt, now() - ttlMs))).run()
+    },
+
+    // --- wake (push trigger) ---
+    // touch the recipient's wake file so its fs.watch fires and it drains now
+    wake(recipient: string) {
+      try { writeFileSync(wakePath(recipient), '') } catch {}
+    },
+    // watch our own wake file; onWake fires (near-instant) when a peer touches it
+    watchInbox(name: string, onWake: () => void) {
+      try { writeFileSync(wakePath(name), '') } catch {} // ensure it exists to watch
+      return watch(wakeDir, (_event, file) => { if (file === null || file === name) onWake() })
     },
 
     close() {
