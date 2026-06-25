@@ -15,13 +15,27 @@ CI runs typecheck + tests on every push and PR; keep both green.
 
 ## Layout
 
-- `server.ts` — the whole channel: MCP tools + the inbox watcher that pushes
-  messages into the session. Start here.
+- `server.ts` — the channel: MCP tools + the poll-and-push delivery loop. Start here.
+- `db/schema.ts` — Drizzle table definitions (`peers`, `messages`).
+- `db/index.ts` — the bus: SQLite client, migrate-on-startup, and all queries.
+- `drizzle/` — generated, versioned SQL migrations (committed).
 - `test/bus.test.ts` — spawns real server processes over stdio and asserts
-  discovery, delivery, rename, and offline queueing.
-- `scripts/` — install / uninstall / doctor helpers.
+  discovery, delivery, rename, offline queueing, and no-loss under concurrency.
+- `scripts/` — install / uninstall / doctor / demo helpers.
 
-See the **How it works** section of the [README](README.md) for the bus design.
+See the **How it works** and **Data & migrations** sections of the
+[README](README.md) for the bus design.
+
+## Changing the schema
+
+The schema is source-of-truth in `db/schema.ts`. After editing it:
+
+```bash
+bun run db:generate   # writes a new drizzle/NNNN_*.sql migration — commit it
+```
+
+Migrations apply automatically on the next session start. Never hand-edit a
+generated migration; change the schema and regenerate.
 
 ## Code style
 

@@ -55,9 +55,12 @@ Peers now address it as `api`. (This is the thing launch-time naming can't do.)
 ## Inspect / debug
 
 ```bash
-bash scripts/doctor.sh                       # runtime + live peers
-ls ~/.claude/channels/inter-claude/peers     # presence files
-ls ~/.claude/channels/inter-claude/inbox/*   # undelivered messages, if any
+bash scripts/doctor.sh   # runtime, registration, live peers, pending/delivered counts
+
+# the bus is just SQLite:
+DB=~/.claude/channels/inter-claude/bus.db
+sqlite3 "$DB" "SELECT name, pid, last_seen FROM peers;"
+sqlite3 "$DB" "SELECT sender, recipient, body, delivered_at FROM messages ORDER BY id DESC LIMIT 10;"
 ```
 
 ## Offline delivery

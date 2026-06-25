@@ -3,14 +3,16 @@
  * inter-claude — a peer-to-peer channel that lets Claude Code sessions talk.
  *
  * Every session launches this file as a channel (an MCP server that pushes
- * events into the session). Sessions discover each other through a shared
- * directory and drop messages into each other's inbox; each server watches its
- * own inbox and pushes new messages straight into its session as <channel>
- * events. No daemon and no network — the filesystem is the bus.
+ * events into the session). All shared state — who is online and every message
+ * with its delivery status — lives in one SQLite database (see db/). A session
+ * inserts a row to send; the recipient's server polls for its undelivered rows,
+ * pushes them into its session as <channel> events, and stamps them delivered.
+ * No daemon and no network: the DB file is the bus.
  *
- *   bus root:  ~/.claude/channels/inter-claude
- *     peers/<name>.json        presence + heartbeat (discovery)
- *     inbox/<name>/<id>.json   messages waiting for <name>
+ * Prior art: clauder (https://github.com/MaorBril/clauder) pioneered
+ * cross-session messaging for Claude Code, also backed by a shared SQLite
+ * store. inter-claude keeps that idea but delivers through the native channels
+ * API instead of terminal injection, and supports live rename.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -19,23 +21,22 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import {
-  mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync, watch,
-} from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
+import { openBus } from './db'
 
 // --- Config -----------------------------------------------------------------
 
 const ROOT =
   process.env.INTER_CLAUDE_HOME ??
   join(homedir(), '.claude', 'channels', 'inter-claude')
-const PEERS_DIR = join(ROOT, 'peers')
-const INBOX_ROOT = join(ROOT, 'inbox')
+const DB_PATH = join(ROOT, 'bus.db')
 
 const HEARTBEAT_MS = 15_000 // how often we refresh our presence
 const STALE_MS = 45_000 // a peer silent this long is treated as offline
-const POLL_MS = 3_000 // fallback sweep, in case an fs.watch event is missed
+const POLL_MS = 500 // how often we check for messages addressed to us
+const PRUNE_MS = 60_000 // how often to drop old delivered messages
+const DELIVERED_TTL_MS = 24 * 60 * 60 * 1000 // keep delivered rows this long
 
 const sanitize = (s: string) =>
   s.toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32)
@@ -44,68 +45,19 @@ let name =
   sanitize(process.env.INTER_CLAUDE_NAME ?? '') ||
   `claude-${Math.random().toString(36).slice(2, 6)}`
 
-const inboxOf = (peer: string) => join(INBOX_ROOT, peer)
+const bus = openBus(DB_PATH)
 
-// --- Registry: presence & discovery -----------------------------------------
+// --- Registry / send (thin wrappers over the bus) ---------------------------
 
-type Peer = { name: string; pid: number; startedAt: number; lastSeen: number }
+const register = () => bus.registerPeer(name, process.pid)
+const heartbeat = () => bus.heartbeat(name, process.pid)
+const listPeers = () => bus.livePeers(STALE_MS)
+const isLive = (peer: string) => bus.isLive(peer, STALE_MS)
 
-function register(): void {
-  mkdirSync(PEERS_DIR, { recursive: true })
-  mkdirSync(inboxOf(name), { recursive: true })
-  const peer: Peer = { name, pid: process.pid, startedAt: Date.now(), lastSeen: Date.now() }
-  writeFileSync(join(PEERS_DIR, `${name}.json`), JSON.stringify(peer))
-}
-
-function heartbeat(): void {
-  try {
-    const f = join(PEERS_DIR, `${name}.json`)
-    const peer: Peer = JSON.parse(readFileSync(f, 'utf8'))
-    peer.lastSeen = Date.now()
-    writeFileSync(f, JSON.stringify(peer))
-  } catch {
-    register() // presence file vanished — recreate it
-  }
-}
-
-function unregister(peer = name): void {
-  try { rmSync(join(PEERS_DIR, `${peer}.json`)) } catch {}
-}
-
-function listPeers(): Peer[] {
-  if (!existsSync(PEERS_DIR)) return []
-  const now = Date.now()
-  const peers: Peer[] = []
-  for (const f of readdirSync(PEERS_DIR)) {
-    if (!f.endsWith('.json')) continue
-    try {
-      const p: Peer = JSON.parse(readFileSync(join(PEERS_DIR, f), 'utf8'))
-      if (now - p.lastSeen > STALE_MS) {
-        unregister(p.name) // reap stale presence
-        continue
-      }
-      peers.push(p)
-    } catch {}
-  }
-  return peers.sort((a, b) => a.name.localeCompare(b.name))
-}
-
-const isLive = (peer: string) => listPeers().some(p => p.name === peer)
-
-// --- Bus: outbound messages --------------------------------------------------
-
-type Message = { id: string; from: string; text: string; ts: number }
-
-let seq = 0
-const nextId = () => `${Date.now()}-${++seq}`
-
-function send(to: string, text: string): Message {
+function send(to: string, text: string): number {
   if (to === name) throw new Error('cannot send to self')
   if (!isLive(to)) throw new Error(`no live peer named "${to}" (try list_peers)`)
-  const msg: Message = { id: nextId(), from: name, text, ts: Date.now() }
-  mkdirSync(inboxOf(to), { recursive: true })
-  writeFileSync(join(inboxOf(to), `${msg.id}.json`), JSON.stringify(msg))
-  return msg
+  return bus.enqueue(name, to, text)
 }
 
 // --- MCP server + tools ------------------------------------------------------
@@ -174,8 +126,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   try {
     switch (req.params.name) {
       case 'send_message': {
-        const m = send(String(args.to), String(args.text))
-        return ok(`sent to ${args.to} (${m.id})`)
+        const id = send(String(args.to), String(args.text))
+        return ok(`sent to ${args.to} (#${id})`)
       }
       case 'broadcast': {
         const text = String(args.text)
@@ -211,60 +163,64 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
 await mcp.connect(new StdioServerTransport())
 
-// --- Inbound delivery: watch our inbox, push into the session ----------------
+// --- Inbound delivery: poll our rows, push, stamp delivered ------------------
 
-function deliver(msg: Message): void {
-  void mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content: msg.text,
-      meta: { from: msg.from, msg_id: msg.id, ts: new Date(msg.ts).toISOString() },
-    },
-  })
-}
+let closed = false
+let draining = false
 
-function drain(): void {
-  const dir = inboxOf(name)
-  if (!existsSync(dir)) return
-  for (const f of readdirSync(dir).filter(f => f.endsWith('.json')).sort()) {
-    const path = join(dir, f)
-    try { deliver(JSON.parse(readFileSync(path, 'utf8'))) } catch {}
-    try { rmSync(path) } catch {}
+async function drain(): Promise<void> {
+  if (closed || draining) return
+  draining = true
+  try {
+    for (const m of bus.pending(name)) {
+      if (closed) return
+      try {
+        await mcp.notification({
+          method: 'notifications/claude/channel',
+          params: {
+            content: m.body,
+            meta: { from: m.sender, msg_id: String(m.id), ts: new Date(m.createdAt).toISOString() },
+          },
+        })
+      } catch {
+        return // transport gone — leave the row pending, deliver it next time
+      }
+      bus.markDelivered(m.id) // mark "gone" only after a successful push
+    }
+  } finally {
+    draining = false
   }
 }
 
-let watcher: ReturnType<typeof watch> | undefined
-function watchInbox(): void {
-  watcher?.close()
-  mkdirSync(inboxOf(name), { recursive: true })
-  watcher = watch(inboxOf(name), () => drain())
-}
-
 function rename(next: string): void {
-  drain() // flush anything addressed to the old name first
-  unregister(name)
+  bus.reassignPending(name, next) // move pending rows to the new name
+  bus.unregisterPeer(name)
   name = next
   register()
-  watchInbox()
-  drain()
+  void drain()
 }
 
 // --- Lifecycle ---------------------------------------------------------------
 
 register()
-watchInbox()
-drain() // deliver anything queued while we were offline (mailbox semantics)
+void drain() // deliver anything queued while we were offline (mailbox semantics)
+bus.prune(DELIVERED_TTL_MS)
 
 const beat = setInterval(heartbeat, HEARTBEAT_MS)
 const poll = setInterval(drain, POLL_MS)
+const pruner = setInterval(() => { if (!closed) bus.prune(DELIVERED_TTL_MS) }, PRUNE_MS)
 
 function shutdown(): void {
+  if (closed) return
+  closed = true
   clearInterval(beat)
   clearInterval(poll)
-  watcher?.close()
-  unregister(name)
+  clearInterval(pruner)
+  try { bus.unregisterPeer(name) } catch {}
+  try { bus.close() } catch {}
   process.exit(0)
 }
+mcp.onclose = shutdown // parent disconnected (stdin EOF) — stop cleanly
 process.on('SIGINT', shutdown)
 process.on('SIGTERM', shutdown)
-process.on('exit', () => unregister(name))
+process.on('exit', () => { if (!closed) { try { bus.unregisterPeer(name) } catch {} } })
