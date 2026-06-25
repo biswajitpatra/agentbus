@@ -9,6 +9,8 @@ the other — the message is **pushed straight into the recipient's running
 session** as a `<channel>` event, no copy-pasting and no polling-the-terminal
 hacks.
 
+![inter-claude demo](assets/demo.gif)
+
 ```
 ┌─ session "frontend" ─────────┐        ┌─ session "backend" ──────────┐
 │ claude  ◀── <channel> push   │        │ claude  ── send_message ──▶   │

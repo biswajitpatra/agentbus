@@ -8,6 +8,7 @@
   "scripts": {
     "start": "bun install --no-summary && bun server.ts",
     "test": "bun test",
+    "demo": "bun scripts/demo.ts",
     "doctor": "bash scripts/doctor.sh",
     "setup": "bash scripts/install.sh"
   },
