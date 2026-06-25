@@ -4,87 +4,56 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A **local message bus for AI agent sessions**. Start two Claude Code sessions and
-one can message the other — the message is **pushed straight into the
-recipient's running session** as a `<channel>` event, through the native
-[channels](https://code.claude.com/docs/en/channels) API. No copy-paste, no
-terminal-injection hacks, no daemon, no network.
+one can message the other — the message lands **in the recipient's running
+session** as a `<channel>` event. No copy-paste, no daemon, no network.
 
 ![agentbus demo](assets/demo.gif)
 
-agentbus is built as a tiny **core + pluggable adapters** (ports & adapters). The
-Claude Code module ships with two delivery modes — **channel** (push, real-time)
-and **hook** (pull, turn-boundary) — and other runtimes (Gemini, Codex, …) slot
-in as sibling modules that can run alongside it. See **[SPEC.md](SPEC.md)**.
+agentbus is three layers (see **[SPEC.md](SPEC.md)**):
+
+1. **core** — the bus: one SQLite db (`~/.agentbus/bus.db`) holding presence
+   (`peers`) and every message with its delivery status (`messages`).
+2. **send (MCP) — always on.** One MCP server, `agentbus`, exposing the
+   tools (`send_message`, `broadcast`, `list_peers`, `whoami`). Universal:
+   every CLI speaks MCP. It never drains the inbox.
+3. **delivery — pluggable, you pick.** How messages land *in* a session.
+   Enable the ones you want, individually:
+   - `claude-channel` — real-time, mid-turn (file-watch + MCP channel push)
+   - `claude-hook` — turn-boundary (Stop/SessionStart hook); works even in the
+     agents panel, no channel flag
+   - *(future)* `gemini-a2a`, … — independent, can run alongside the Claude ones
 
 ```mermaid
 flowchart LR
+    subgraph S1["session: frontend"]
+        SEND1["agentbus (send)"]
+        C1["claude"]
+    end
     subgraph S2["session: backend"]
         C2["claude"]
-        A2["claude adapter<br/>Delivery + Trigger"]
-    end
-    subgraph S1["session: frontend"]
-        A1["claude adapter<br/>Delivery + Trigger"]
-        C1["claude"]
+        DLV2["delivery<br/>(channel / hook)"]
     end
     DB[("CORE — bus.db (SQLite)<br/>peers · messages")]
 
-    C1 -- "send_message" --> A1
-    A1 -- "INSERT (enqueue)" --> DB
-    A1 -. "Trigger.notify (wake)" .-> A2
-    DB -- "pending rows" --> A2
-    A2 -- "Delivery: &lt;channel&gt; push" --> C2
-    A2 -. "mark delivered" .-> DB
+    C1 -- "send_message" --> SEND1
+    SEND1 -- "INSERT (enqueue)" --> DB
+    SEND1 -. "wake" .-> DLV2
+    DB -- "pending rows" --> DLV2
+    DLV2 -- "&lt;channel&gt; into session" --> C2
+    DLV2 -. "mark delivered" .-> DB
 
     classDef db fill:#1f2430,stroke:#5b6273,color:#cdd3e0;
     class DB db;
 ```
 
-All shared state lives in **one SQLite database** (`bus.db`): who's online
-(`peers`) and every message with its delivery status (`messages`). Sending is an
-`INSERT`; the recipient's adapter drains its undelivered rows, pushes them into
-its session, and stamps them delivered.
-
-## Architecture
-
-Three pieces, cleanly separated (full contracts in [SPEC.md](SPEC.md)):
-
-- **core/** — the runtime-agnostic bus: presence, a durable mailbox, delivery
-  tracking. Knows nothing about MCP or how a message reaches a session.
-- Two **ports**: `Trigger` (PULL — how a recipient is woken) and `Delivery`
-  (PUSH — how a message enters a live session).
-- **adapters/** — a *module* per runtime, each with a `module.json` declaring one
-  or more **delivery modes** (a Trigger + Delivery pairing). Ships: `claude` with
-  `channel` (file-watch + MCP channel) and `hook` (Stop/SessionStart hooks +
-  `additionalContext`). Modules are **independent and stackable** — Gemini and
-  Codex would be sibling modules you can enable *alongside* `claude`, all sharing
-  one bus (so a Claude session can message a Gemini session). Adding one never
-  touches the core.
+Send (one always-on MCP server) is cleanly separate from receive (the delivery
+you choose), so turning a delivery on or off never affects your ability to send,
+and one delivery never swallows messages meant for another.
 
 Why not just use A2A? A2A standardizes remote agent *services* (HTTP servers);
 it structurally can't push an unsolicited message into a live stdio session.
-agentbus does that last mile and keeps its envelope A2A-shaped so a remote leg
-can be bolted on as an adapter. (Details in [SPEC.md §9](SPEC.md).)
-
-## Delivery modes
-
-The `claude` module offers two ways to receive — pick one, or run **both**:
-
-| | **channel** (push) | **hook** (pull) |
-|---|---|---|
-| arrives | in real time, mid-turn | at the next turn end / session start |
-| how | MCP `<channel>` push, woken by file-watch | a `Stop`/`SessionStart` hook drains the inbox |
-| launch | `claude --dangerously-load-development-channels server:agentbus` | plain `claude` (no flag) |
-| works in the agents panel? | ✗ (can't pass the channel flag) | ✓ |
-| process | a long-running MCP server | a short script Claude Code invokes |
-
-They're **not mutually exclusive**. Enable both and you get real-time delivery
-when the session loaded channels, with the hook as a guaranteed turn-boundary
-fallback — safe because both drain the *same* bus and a row is delivered by
-whichever flips its `deliveredAt` first (at-least-once; dedupe on `msg_id`).
-
-```bash
-bun run agentbus enable claude all    # channel + hook
-```
+agentbus does that last mile, and keeps its envelope A2A-shaped so a remote leg
+can be added later as just another delivery. (Details in [SPEC.md §9](SPEC.md).)
 
 ## Requirements
 
@@ -100,50 +69,56 @@ cd agentbus
 bash scripts/install.sh
 ```
 
-This installs deps and enables the `claude` module in **channel** mode (registers
-it as a user-level MCP server, reachable from any directory).
-
-Manage modules and modes anytime:
+This installs deps and registers the always-on `agentbus` send server, then lists
+the deliveries. Turn on the one(s) you want:
 
 ```bash
-bun run agentbus list                 # modules, modes, and which are on
-bun run agentbus enable claude        # channel (default)
-bun run agentbus enable claude hook   # also turn on the hook mode (they stack)
-bun run agentbus enable claude all    # every mode
-bun run agentbus disable claude hook  # turn one mode off
-bun run agentbus doctor               # runtime, registration, live peers, mailboxes
+bun run agentbus enable claude-channel   # real-time
+bun run agentbus enable claude-hook      # turn-boundary; works in the agents panel
+bun run agentbus list                    # what's on
+bun run agentbus disable claude-channel
 ```
+
+There's intentionally **no "enable all"** — pick each delivery deliberately.
 
 ## Uninstall
 
 ```bash
-bun run uninstall            # disable every module + remove the bus
+bun run uninstall            # remove the send server + every delivery + the bus
 ```
 
-Removes the MCP registration, the SQLite bus (db + WAL/SHM, wake files, lock).
-Restart any running session to fully drop the loaded channel. The cloned repo is
-left in place.
+Restart any running session to fully drop the loaded server/hook. The cloned
+repo is left in place.
 
 ## Use
 
-Channels are opt-in per session. In one terminal:
+Give each session a name with `AGENTBUS_NAME`. Launch depends on the delivery:
 
 ```bash
-AGENTBUS_NAME=frontend claude --dangerously-load-development-channels server:agentbus
+# claude-channel (real-time): load the channel
+AGENTBUS_NAME=frontend claude --dangerously-load-development-channels server:agentbus-channel
+
+# claude-hook (turn-boundary): no flag needed
+AGENTBUS_NAME=backend claude
 ```
 
-In another:
+(`bun run agentbus launch claude-channel frontend` prints the exact command.)
+
+Now ask `frontend`: *"send_message to backend: what's the API contract?"* —
+`backend` receives it as a `<channel source="agentbus" from="frontend">` event
+and replies with `send_message`.
+
+You can also send straight from a shell (no MCP needed) — handy in scripts or a
+hook-only session:
 
 ```bash
-AGENTBUS_NAME=backend  claude --dangerously-load-development-channels server:agentbus
+AGENTBUS_NAME=frontend bun run agentbus send backend "what's the API contract?"
+bun run agentbus peers
 ```
-
-Now ask `frontend`: *"list_peers, then send_message to backend asking what the API contract is."*
-`backend` receives it mid-session as a `<channel source="agentbus" from="frontend">` event and can reply with `send_message`.
 
 See [`examples/two-sessions.md`](examples/two-sessions.md) for a full walkthrough.
 
-## Tools
+## Tools (from the `agentbus` send server)
 
 | Tool | Args | Description |
 |------|------|-------------|
@@ -151,9 +126,8 @@ See [`examples/two-sessions.md`](examples/two-sessions.md) for a full walkthroug
 | `broadcast` | `text` | Message every other online peer |
 | `list_peers` | — | Sessions currently online |
 | `whoami` | — | This session's name |
-| `set_name` | `name` | Rename this session live |
 
-Incoming messages arrive as:
+Incoming messages arrive (via your chosen delivery) as:
 
 ```
 <channel source="agentbus" from="frontend" msg_id="42" ts="...">
@@ -165,31 +139,31 @@ To reply, call `send_message` with `to` set to the `from` value.
 
 ## How it works
 
-- **Discovery** — each session upserts a row in `peers` and refreshes `last_seen`
-  every 15s. A peer silent for 45s is treated as offline and reaped.
-- **Delivery** — `send_message` does an `INSERT` into `messages` (`delivered_at`
-  NULL) and fires `Trigger.notify`. The recipient's adapter drains its
-  undelivered rows, pushes each via the `Delivery` port, then sets `delivered_at`
-  (so a row is marked delivered **only after** a successful push — at-least-once,
-  never silently lost). A 3 s poll runs as a safety net.
-- **Offline mailbox** — a row sits undelivered until the recipient is online, so
-  you can message a peer that hasn't started yet; it drains on launch.
-- **Audit** — `delivered_at IS NULL` is pending, a timestamp means delivered.
-  `bun run agentbus doctor` shows pending/delivered counts per peer.
+- **Discovery** — a participating session (one with `AGENTBUS_NAME` set) upserts a
+  `peers` row and refreshes `last_seen`. A peer silent for 45s is reaped.
+- **Send** — `send_message` does an `INSERT` into `messages` (`delivered_at`
+  NULL) and fires a wake. Sending queues for *any* name (mailbox semantics), so
+  you can message a peer that's idle or hasn't started yet.
+- **Delivery** — your enabled delivery drains undelivered rows and sets
+  `delivered_at` **only after** it lands them in the session (at-least-once,
+  never silently lost). `claude-channel` does it in real time on a file-watch
+  wake (3s poll as a safety net); `claude-hook` does it at each turn boundary.
+- **Multiple deliveries are safe** — they share the bus, so a row is delivered by
+  whichever drains it first; the others find it gone. Duplicates (rare races) are
+  deduped on `msg_id`.
+- **Audit** — `bun run agentbus doctor` shows live peers + pending/delivered counts.
 
-**Triggers are pluggable.** The default `file-watch` Trigger touches a per-peer
-wake file and `fs.watch`es it (`kqueue`/`inotify`) for near-instant, daemon-free
-push — SQLite can't notify other processes
+`claude-channel`'s wake is a per-peer file watched with `fs.watch` — SQLite can't
+notify other processes
 ([`update_hook` is same-process only](https://sqlite.org/c3ref/update_hook.html)),
 so cross-session delivery needs an external nudge. Set `AGENTBUS_TRIGGER=poll` to
-swap in the interval Trigger where filesystem events don't work.
+use an interval instead.
 
 ## Data & migrations
 
-The schema is defined with [Drizzle ORM](https://orm.drizzle.team) in
-[`core/schema.ts`](core/schema.ts); all queries go through the small bus in
-[`core/bus.ts`](core/bus.ts). Versioned migrations live in `drizzle/` and are
-**applied automatically on startup**. To evolve the schema later:
+Schema is defined with [Drizzle ORM](https://orm.drizzle.team) in
+[`core/schema.ts`](core/schema.ts); queries go through [`core/bus.ts`](core/bus.ts).
+Versioned migrations live in `drizzle/` and apply automatically on startup:
 
 ```bash
 # edit core/schema.ts, then:
@@ -205,32 +179,34 @@ sqlite3 ~/.agentbus/bus.db \
 
 ## Security
 
-A channel message is injected into the agent's context, which is a
-prompt-injection surface. agentbus is scoped to **one machine, one user**: the
-bus is a SQLite file under your home directory and peers are other local sessions
-you started. It listens on **no network port**. Don't point `AGENTBUS_HOME` at a
-shared or world-writable location, and be deliberate about combining it with
+A delivered message is injected into the agent's context — a prompt-injection
+surface. agentbus is scoped to **one machine, one user**: the bus is a SQLite
+file under your home and peers are other local sessions you started. It listens
+on **no network port**. Don't point `AGENTBUS_HOME` at a shared or
+world-writable location, and be deliberate about combining it with
 `--dangerously-skip-permissions`. See [SECURITY.md](SECURITY.md).
 
 ## Project layout
 
 ```
-core/schema.ts             Drizzle table definitions (peers, messages)
-core/bus.ts                the bus: SQLite client + migrations + queries
-core/ports.ts              the standard: Envelope, Trigger, Delivery contracts
-core/paths.ts              where the bus lives (~/.agentbus)
-triggers/file-watch.ts     wake-file Trigger (default, event-driven)
-triggers/poll.ts           interval Trigger (fallback)
-adapters/claude/           the Claude Code module (module.json: channel + hook modes)
-  ├─ server.ts             channel mode: MCP server + channel push (long-running)
-  └─ drain.ts              hook mode: Stop/SessionStart inbox drain (invoked by CC)
-drizzle/                   generated, versioned SQL migrations
-cli.ts                     module manager (list/enable/disable/doctor/uninstall)
-scripts/install.sh         bootstrap: deps + enable claude
-scripts/demo.ts            self-driving demo (records the README cast)
-examples/two-sessions.md   end-to-end walkthrough
-test/bus.test.ts           integration tests over real stdio processes
-SPEC.md                    the agentbus standard
+core/schema.ts                  Drizzle tables (peers, messages)
+core/bus.ts                     the bus: SQLite client + migrations + queries
+core/ports.ts                   the standard: Envelope, Trigger, Delivery
+core/paths.ts                   where the bus lives (~/.agentbus)
+triggers/file-watch.ts          wake-file Trigger (default, event-driven)
+triggers/poll.ts                interval Trigger (fallback)
+adapters/send.ts                the always-on MCP send server ("agentbus")
+adapters/send.json              its manifest
+adapters/deliveries/            pluggable inbound deliveries (one manifest each)
+  ├─ claude-channel.ts/.json    MCP channel server (file-watch + channel push)
+  └─ claude-hook.ts/.json       Stop/SessionStart hook (additionalContext)
+drizzle/                        generated, versioned SQL migrations
+cli.ts                          manager (install/list/enable/disable/send/peers/doctor/uninstall)
+scripts/install.sh              bootstrap: deps + register send + list deliveries
+scripts/demo.ts                 self-driving demo (records the README cast)
+examples/two-sessions.md        end-to-end walkthrough
+test/                           integration tests over real stdio processes
+SPEC.md                         the agentbus standard
 ```
 
 ## Prior art
@@ -238,9 +214,9 @@ SPEC.md                    the agentbus standard
 [clauder](https://github.com/MaorBril/clauder) pioneered cross-session messaging
 for Claude Code over a shared SQLite store, and
 [session-bridge](https://blog.shreyaspatil.dev/session-bridge-i-made-two-claude-code-sessions-talk-to-each-other/)
-does it with a file mailbox. agentbus keeps the local-SQLite idea but delivers through the
-native channels API, adds live rename and delivery tracking, and factors the
-transport into pluggable ports so other runtimes can join.
+does it with a file mailbox. agentbus keeps the local-SQLite idea, separates an
+always-on MCP send layer from pluggable deliveries (channel, hook, …), and tracks
+delivery so messages are never silently lost.
 
 ## License
 

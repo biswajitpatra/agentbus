@@ -1,0 +1,8 @@
+{
+  "id": "send",
+  "title": "MCP send tools (core + push)",
+  "runtime": "any-mcp",
+  "always": true,
+  "entry": "adapters/send.ts",
+  "register": { "kind": "claude-mcp-server", "name": "agentbus" }
+}

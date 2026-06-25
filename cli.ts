@@ -1,21 +1,22 @@
 #!/usr/bin/env bun
 /**
- * agentbus — the module manager.
+ * agentbus — the manager.
  *
- * agentbus is daemonless: the SQLite bus IS the central place. A "module" is a
- * runtime (described by adapters/<id>/module.json); each module offers one or
- * more delivery **modes** — how messages reach a session. Modes can stack, and
- * modules are independent. The Claude Code module offers:
- *   - channel: push, real-time (file-watch/poll + MCP channel)
- *   - hook:    pull, turn-boundary (Claude Code Stop/SessionStart hooks)
- * This CLI enables/disables those modes and inspects the bus.
+ * Three layers (see SPEC.md):
+ *   - core      : the SQLite bus (presence + mailbox + delivery tracking).
+ *   - send (MCP): the always-on `agentbus` MCP server — send_message/list_peers/…
+ *                 Universal: every CLI speaks MCP. This CLI keeps it registered.
+ *   - delivery  : how messages land IN a session. Pluggable, multi-select —
+ *                 claude-channel (file-watch + channel), claude-hook (Stop/
+ *                 SessionStart), gemini-a2a (future). Enable any combination.
  *
- *   agentbus list                    modules, modes, and which is active
- *   agentbus enable <id> [mode]      enable a delivery mode (omit=default, "all"=every)
- *   agentbus disable <id>            turn a module off
- *   agentbus launch <id> [name]      print the command to start a session
+ *   agentbus install                 register send + show deliveries
+ *   agentbus list                    send + deliveries, and which are on
+ *   agentbus enable <delivery>       turn on one delivery (also ensures send)
+ *   agentbus disable <delivery>      turn off a delivery
+ *   agentbus launch <delivery> [name]  print the command to start a session
  *   agentbus doctor                  diagnose runtime, registration, peers, mailboxes
- *   agentbus uninstall               disable every module + remove the bus
+ *   agentbus uninstall               remove send + every delivery + the bus
  */
 import { Database } from 'bun:sqlite'
 import { readdirSync, readFileSync, writeFileSync, existsSync, copyFileSync, rmSync } from 'fs'
@@ -23,15 +24,17 @@ import { join } from 'path'
 import { homedir } from 'os'
 import { styleText } from 'node:util'
 import { DB_PATH, WAKE_DIR, HOME } from './core/paths'
+import { openBus } from './core/bus'
+import { fileWatchTrigger } from './triggers/file-watch'
 
 const REPO = import.meta.dir
-const ADAPTERS = join(REPO, 'adapters')
+const DELIVERIES_DIR = join(REPO, 'adapters', 'deliveries')
+const SEND_MANIFEST = join(REPO, 'adapters', 'send.json')
 const CLAUDE_JSON = join(homedir(), '.claude.json')
 const SETTINGS_JSON = join(homedir(), '.claude', 'settings.json')
 
 type Register = { kind: string; name?: string; events?: string[] }
-type Mode = { title: string; delivery: string; trigger: string; entry: string; register: Register; launch: string }
-type Module = { id: string; title: string; runtime: string; defaultMode: string; modes: Record<string, Mode> }
+type Unit = { id: string; title: string; runtime: string; entry: string; register: Register; launch?: string; always?: boolean }
 
 const C = {
   dim: (s: string) => styleText('dim', s),
@@ -41,20 +44,20 @@ const C = {
   cyan: (s: string) => styleText('cyan', s),
 }
 
-function modules(): Module[] {
-  if (!existsSync(ADAPTERS)) return []
-  return readdirSync(ADAPTERS, { withFileTypes: true })
-    .filter(d => d.isDirectory())
-    .map(d => join(ADAPTERS, d.name, 'module.json'))
-    .filter(existsSync)
-    .map(p => JSON.parse(readFileSync(p, 'utf8')) as Module)
+const send = (): Unit => JSON.parse(readFileSync(SEND_MANIFEST, 'utf8'))
+
+function deliveries(): Unit[] {
+  if (!existsSync(DELIVERIES_DIR)) return []
+  return readdirSync(DELIVERIES_DIR)
+    .filter(f => f.endsWith('.json'))
+    .map(f => JSON.parse(readFileSync(join(DELIVERIES_DIR, f), 'utf8')) as Unit)
     .sort((a, b) => a.id.localeCompare(b.id))
 }
 
-function getModule(id: string): Module {
-  const m = modules().find(x => x.id === id)
-  if (!m) { console.error(C.red(`unknown module "${id}"`)); console.error('run: agentbus list'); process.exit(1) }
-  return m
+function getDelivery(id: string): Unit {
+  const d = deliveries().find(x => x.id === id)
+  if (!d) { console.error(C.red(`unknown delivery "${id}"`)); console.error('run: agentbus list'); process.exit(1) }
+  return d
 }
 
 // --- JSON config helpers -----------------------------------------------------
@@ -66,16 +69,16 @@ function writeJson(path: string, d: any): void {
   if (existsSync(path)) copyFileSync(path, `${path}.bak-agentbus`)
   writeFileSync(path, JSON.stringify(d, null, 2))
 }
-const hookCommand = (mode: Mode) => `bun ${join(REPO, mode.entry)}`
+const hookCommand = (u: Unit) => `bun ${join(REPO, u.entry)}`
 
-// --- per-mode registration (dispatch by register.kind) -----------------------
+// --- registration (dispatch by register.kind) --------------------------------
 
-function isModeEnabled(mode: Mode): boolean {
-  if (mode.register.kind === 'claude-mcp-server') {
-    return Boolean(readJson(CLAUDE_JSON).mcpServers?.[mode.register.name!])
+function isEnabled(u: Unit): boolean {
+  if (u.register.kind === 'claude-mcp-server') {
+    return Boolean(readJson(CLAUDE_JSON).mcpServers?.[u.register.name!])
   }
-  if (mode.register.kind === 'claude-hook') {
-    const cmd = hookCommand(mode)
+  if (u.register.kind === 'claude-hook') {
+    const cmd = hookCommand(u)
     const hooks = readJson(SETTINGS_JSON).hooks ?? {}
     return Object.values(hooks).some((arr: any) =>
       (arr as any[]).some(g => (g.hooks ?? []).some((h: any) => h.command === cmd)))
@@ -83,36 +86,36 @@ function isModeEnabled(mode: Mode): boolean {
   return false
 }
 
-function registerMode(mode: Mode): void {
-  if (mode.register.kind === 'claude-mcp-server') {
+function registerUnit(u: Unit): void {
+  if (u.register.kind === 'claude-mcp-server') {
     const d = readJson(CLAUDE_JSON)
-    ;(d.mcpServers ??= {})[mode.register.name!] = { command: 'bun', args: [join(REPO, mode.entry)] }
+    ;(d.mcpServers ??= {})[u.register.name!] = { command: 'bun', args: [join(REPO, u.entry)] }
     writeJson(CLAUDE_JSON, d)
-  } else if (mode.register.kind === 'claude-hook') {
+  } else if (u.register.kind === 'claude-hook') {
     const d = readJson(SETTINGS_JSON)
-    const cmd = hookCommand(mode)
+    const cmd = hookCommand(u)
     d.hooks ??= {}
-    for (const ev of mode.register.events ?? []) {
+    for (const ev of u.register.events ?? []) {
       d.hooks[ev] ??= []
       const present = (d.hooks[ev] as any[]).some(g => (g.hooks ?? []).some((h: any) => h.command === cmd))
       if (!present) d.hooks[ev].push({ hooks: [{ type: 'command', command: cmd }] })
     }
     writeJson(SETTINGS_JSON, d)
   } else {
-    console.error(C.red(`don't know how to register kind "${mode.register.kind}" yet`)); process.exit(1)
+    console.error(C.red(`don't know how to register kind "${u.register.kind}" yet`)); process.exit(1)
   }
 }
 
-function unregisterMode(mode: Mode): boolean {
-  if (mode.register.kind === 'claude-mcp-server') {
+function unregisterUnit(u: Unit): boolean {
+  if (u.register.kind === 'claude-mcp-server') {
     const d = readJson(CLAUDE_JSON)
-    const had = Boolean(d.mcpServers && mode.register.name! in d.mcpServers)
-    if (had) { delete d.mcpServers[mode.register.name!]; writeJson(CLAUDE_JSON, d) }
+    const had = Boolean(d.mcpServers && u.register.name! in d.mcpServers)
+    if (had) { delete d.mcpServers[u.register.name!]; writeJson(CLAUDE_JSON, d) }
     return had
   }
-  if (mode.register.kind === 'claude-hook') {
+  if (u.register.kind === 'claude-hook') {
     const d = readJson(SETTINGS_JSON)
-    const cmd = hookCommand(mode)
+    const cmd = hookCommand(u)
     let had = false
     for (const ev of Object.keys(d.hooks ?? {})) {
       const before = (d.hooks[ev] as any[]).length
@@ -126,64 +129,57 @@ function unregisterMode(mode: Mode): boolean {
   return false
 }
 
-/** The currently-enabled mode ids for a module (may be several, or none). */
-function activeModes(m: Module): string[] {
-  return Object.entries(m.modes).filter(([, mode]) => isModeEnabled(mode)).map(([id]) => id)
-}
+const whereOf = (u: Unit) =>
+  u.register.kind === 'claude-hook'
+    ? `${(u.register.events ?? []).join('/')} hooks in ~/.claude/settings.json`
+    : `MCP server "${u.register.name}" in ~/.claude.json`
 
-const whereOf = (mode: Mode) =>
-  mode.register.kind === 'claude-hook'
-    ? `${(mode.register.events ?? []).join('/')} hooks in ~/.claude/settings.json`
-    : `MCP server "${mode.register.name}" in ~/.claude.json`
+function ensureSend(): void {
+  const s = send()
+  if (!isEnabled(s)) { registerUnit(s); console.log(C.green(`✓ send on`) + C.dim(` (${whereOf(s)})`)) }
+}
 
 // --- commands ----------------------------------------------------------------
 
-// Modes are NOT mutually exclusive: enable any subset. They cooperate through the
-// bus — whichever mechanism drains a pending row first delivers it; the others
-// find it already gone. "all" enables every mode; omitting the mode uses default.
-function enable(m: Module, modeId?: string): void {
-  const ids = modeId === 'all' ? Object.keys(m.modes) : [modeId ?? m.defaultMode]
-  for (const id of ids) {
-    const mode = m.modes[id]
-    if (!mode) {
-      console.error(C.red(`unknown mode "${id}" for ${m.id}`))
-      console.error(`modes: ${Object.keys(m.modes).join(', ')}, or "all"`); process.exit(1)
-    }
-    registerMode(mode)
-    console.log(C.green(`✓ ${m.id} → ${id} enabled`) + C.dim(` (${whereOf(mode)})`))
-    console.log(C.dim('  launch: ') + C.cyan(mode.launch))
-  }
-  if (activeModes(m).length > 1)
-    console.log(C.dim('\n  multiple modes active — whichever drains a message first delivers it.'))
+function cmdInstall(): void {
+  ensureSend()
+  console.log(C.dim('\nenable a delivery (you can enable more than one):'))
+  for (const d of deliveries()) console.log(`  agentbus enable ${C.bold(d.id)}${C.dim(`   ${d.title}`)}`)
 }
 
-function disable(m: Module, modeId?: string): void {
-  const ids = modeId && modeId !== 'all' ? [modeId] : Object.keys(m.modes)
-  let had = false
-  for (const id of ids) { const mode = m.modes[id]; if (mode) had = unregisterMode(mode) || had }
-  const scope = modeId && modeId !== 'all' ? ` (${modeId})` : ''
-  console.log(had ? C.green(`✓ disabled ${m.id}${scope}`) : C.dim(`- ${m.id}${scope} was not enabled`))
+function enable(id: string): void {
+  if (id === 'send') { ensureSend(); return }
+  // Deliberately no "all": each delivery is enabled individually.
+  const d = getDelivery(id)
+  ensureSend() // a delivery is useless without the send layer
+  registerUnit(d)
+  console.log(C.green(`✓ ${d.id} on`) + C.dim(` (${whereOf(d)})`))
+  if (d.launch) console.log(C.dim('  launch: ') + C.cyan(d.launch))
+}
+
+function disable(id: string): void {
+  const u = id === 'send' ? send() : getDelivery(id)
+  const had = unregisterUnit(u)
+  console.log(had ? C.green(`✓ ${id} off`) : C.dim(`- ${id} was not on`))
+  if (id === 'send') console.log(C.dim('  (send is the base layer — you usually want `agentbus uninstall` instead)'))
 }
 
 function cmdList(): void {
-  const ms = modules()
-  if (!ms.length) { console.log('no modules found under adapters/'); return }
-  console.log(C.bold('agentbus modules\n'))
-  for (const m of ms) {
-    const active = activeModes(m)
-    console.log(`  ${active.length ? C.green('●') : C.dim('○')} ${C.bold(m.id)}${C.dim(` — ${m.title}  [runtime: ${m.runtime}]`)}`)
-    for (const [id, mode] of Object.entries(m.modes)) {
-      const on = active.includes(id)
-      console.log(`      ${on ? C.green('▸') : C.dim('·')} ${id}${C.dim(`  ${mode.title}`)}${on ? C.green('   ← on') : ''}`)
-    }
+  const s = send()
+  console.log(C.bold('agentbus\n'))
+  console.log(`  ${isEnabled(s) ? C.green('●') : C.dim('○')} ${C.bold('send')}${C.dim(`  — ${s.title}  [always-on]`)}`)
+  console.log(C.dim('  deliveries:'))
+  for (const d of deliveries()) {
+    const on = isEnabled(d)
+    console.log(`  ${on ? C.green('●') : C.dim('○')} ${C.bold(d.id)}${C.dim(`  — ${d.title}`)}${on ? C.green('  ← on') : ''}`)
   }
-  console.log(C.dim('\n  enable: agentbus enable <id> [mode|all]   (modes can stack; modules are independent)'))
+  console.log(C.dim('\n  enable each you want, individually: agentbus enable <delivery>'))
 }
 
 function cmdLaunch(id: string, name?: string): void {
-  const m = getModule(id)
-  const mode = m.modes[activeModes(m)[0] ?? m.defaultMode]
-  console.log(name ? mode.launch.replace('<name>', name) : mode.launch)
+  const d = getDelivery(id)
+  if (!d.launch) { console.error(C.red(`${id} has no launch command`)); process.exit(1) }
+  console.log(name ? d.launch.replace('<name>', name) : d.launch)
 }
 
 function cmdDoctor(): void {
@@ -193,11 +189,9 @@ function cmdDoctor(): void {
   line(Boolean(Bun.which('bun')), `bun ${Bun.version}`)
   line(Boolean(Bun.which('claude')), 'claude CLI on PATH  (channels need >= 2.1.80)')
 
-  console.log('\n' + C.bold('modules'))
-  for (const m of modules()) {
-    const active = activeModes(m)
-    line(active.length > 0, `${m.id} ${active.length ? `→ ${active.join(', ')}` : C.dim('disabled')}`)
-  }
+  console.log('\n' + C.bold('layers'))
+  line(isEnabled(send()), `send ${isEnabled(send()) ? 'on' : C.dim('off — run: agentbus install')}`)
+  for (const d of deliveries()) line(isEnabled(d), `${d.id} ${isEnabled(d) ? 'on' : C.dim('off')}`)
 
   console.log('\n' + C.bold('bus') + C.dim(`  ${DB_PATH}`))
   if (!existsSync(DB_PATH)) { console.log(C.dim('  (no bus yet — start a session first)')); return }
@@ -220,34 +214,66 @@ function cmdDoctor(): void {
   } finally { db.close() }
 }
 
+// Send / list straight over the bus — no MCP server needed. Handy for scripts
+// and for hook-only sessions, which can shell out to this to send a reply.
+const sanitize = (s: string) => s.toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32)
+
+function cmdSend(to: string, message: string): void {
+  const target = sanitize(to)
+  if (!target || !message) { console.error('usage: agentbus send <to> "message"'); process.exit(1) }
+  const from = sanitize(process.env.AGENTBUS_NAME ?? '') || 'cli'
+  const bus = openBus(DB_PATH)
+  const id = bus.enqueue(from, target, message)
+  bus.close()
+  fileWatchTrigger(WAKE_DIR).notify(target) // wake a live channel receiver now
+  console.log(C.green('✓ sent') + C.dim(` ${from} → ${target} (#${id})`))
+}
+
+function cmdPeers(): void {
+  if (!existsSync(DB_PATH)) { console.log('no peers online'); return }
+  const bus = openBus(DB_PATH)
+  const peers = bus.livePeers(45_000)
+  bus.close()
+  console.log(peers.length ? peers.map(p => `  ${p.name}`).join('\n') : 'no peers online')
+}
+
 function cmdUninstall(): void {
-  for (const m of modules()) disable(m)
+  for (const u of [send(), ...deliveries()]) {
+    const had = unregisterUnit(u)
+    if (had) console.log(C.green(`✓ ${u.id} off`))
+  }
   for (const f of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`, `${DB_PATH}.init.lock`]) {
     try { rmSync(f) } catch {}
   }
   try { rmSync(WAKE_DIR, { recursive: true, force: true }) } catch {}
   try { rmSync(HOME, { recursive: false }) } catch {} // only if now empty
-  console.log(C.green('\n✓ uninstalled') + C.dim(' — restart any running session to drop the loaded channel/hook.'))
+  console.log(C.green('\n✓ uninstalled') + C.dim(' — restart any running session to drop the loaded server/hook.'))
 }
 
 function usage(): void {
   console.log(`agentbus — local message bus for AI agent sessions
 
 usage:
-  agentbus list                  modules, modes, and which is active
-  agentbus enable <id> [mode]    enable a delivery mode (omit=default, "all"=every mode)
-  agentbus disable <id> [mode]   disable one mode, or the whole module
-  agentbus launch <id> [name]    print the command to start a session
-  agentbus doctor                diagnose runtime, registration, peers, mailboxes
-  agentbus uninstall             disable every module + remove the bus`)
+  agentbus install                 register the always-on send server + list deliveries
+  agentbus list                    send + deliveries, and which are on
+  agentbus enable <delivery>       turn on one delivery (also ensures send)
+  agentbus disable <delivery>      turn off a delivery
+  agentbus launch <delivery> [name]  print the command to start a session
+  agentbus send <to> "message"     enqueue a message over the bus (no MCP needed)
+  agentbus peers                   list peers currently online
+  agentbus doctor                  diagnose runtime, registration, peers, mailboxes
+  agentbus uninstall               remove send + every delivery + the bus`)
 }
 
 const [cmd, a1, a2] = process.argv.slice(2)
 switch (cmd) {
+  case 'install': cmdInstall(); break
   case 'list': cmdList(); break
-  case 'enable': enable(getModule(a1), a2); break
-  case 'disable': disable(getModule(a1), a2); break
-  case 'launch': cmdLaunch(a1, a2); break
+  case 'enable': if (!a1) { usage(); process.exit(1) } enable(a1); break
+  case 'disable': if (!a1) { usage(); process.exit(1) } disable(a1); break
+  case 'launch': if (!a1) { usage(); process.exit(1) } cmdLaunch(a1, a2); break
+  case 'send': if (!a1) { usage(); process.exit(1) } cmdSend(a1, process.argv.slice(4).join(' ')); break
+  case 'peers': cmdPeers(); break
   case 'doctor': cmdDoctor(); break
   case 'uninstall': cmdUninstall(); break
   default: usage(); if (cmd) process.exit(1)

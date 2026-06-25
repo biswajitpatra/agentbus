@@ -2,7 +2,7 @@
   "mcpServers": {
     "agentbus": {
       "command": "bun",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/adapters/claude/server.ts"]
+      "args": ["${CLAUDE_PLUGIN_ROOT}/adapters/send.ts"]
     }
   }
 }

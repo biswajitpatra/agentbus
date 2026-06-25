@@ -11,7 +11,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 
 function runHook(home: string, name: string) {
-  const proc = Bun.spawn(['bun', 'adapters/claude/drain.ts'], {
+  const proc = Bun.spawn(['bun', 'adapters/deliveries/claude-hook.ts'], {
     env: { ...process.env, AGENTBUS_NAME: name, AGENTBUS_HOME: home },
     stdin: new TextEncoder().encode(JSON.stringify({ hook_event_name: 'Stop', session_id: 'sess123' })),
     stdout: 'pipe',

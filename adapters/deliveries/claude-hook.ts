@@ -1,22 +1,19 @@
 #!/usr/bin/env bun
 /**
- * claude / hook mode — the *pull* delivery for Claude Code (agentbus).
+ * delivery: claude-hook — turn-boundary inbound for Claude Code (agentbus).
  *
- * Where the channel mode is a long-running server that PUSHES messages mid-turn via
- * the channels API, this is the opposite shape: a short-lived script that Claude Code
- * invokes at a lifecycle boundary (SessionStart, Stop). On each invocation it
+ * Where claude-channel is a long-running server that PUSHES messages mid-turn via
+ * the channels API, this is the opposite shape: a short-lived script that Claude
+ * Code invokes at a lifecycle boundary (SessionStart, Stop). On each invocation it
  * reads this session's pending messages and injects them as `additionalContext`,
- * then marks them delivered — a PULL at the turn boundary.
- *
- * Same two ports as every adapter, implemented differently:
- *   - Trigger  (PULL): the Claude Code hook lifecycle (no file-watch, no daemon).
- *   - Delivery (PUSH): the hook's `hookSpecificOutput.additionalContext` output.
+ * then marks them delivered — a PULL at the turn boundary. Sending is unaffected:
+ * that's the always-on `agentbus` send server.
  *
  * The win: it needs NO channel flag, so it reaches sessions that can't load
  * channels (e.g. ones dispatched from the agents panel). The cost: messages
  * arrive only at turn boundaries, not in real time.
  *
- * Registered in ~/.claude/settings.json by `agentbus enable claude hook`.
+ * Registered in ~/.claude/settings.json by `agentbus enable claude-hook`.
  */
 import { openBus } from '../../core/bus'
 import { DB_PATH } from '../../core/paths'

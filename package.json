@@ -6,7 +6,7 @@
   "type": "module",
   "bin": { "agentbus": "./cli.ts" },
   "scripts": {
-    "start": "bun install --no-summary && bun adapters/claude/server.ts",
+    "start": "bun install --no-summary && bun adapters/send.ts",
     "agentbus": "bun cli.ts",
     "test": "bun test",
     "demo": "bun scripts/demo.ts",

@@ -1,0 +1,8 @@
+{
+  "id": "claude-channel",
+  "title": "Claude — channel (real-time, file-watch + MCP channel)",
+  "runtime": "claude-code",
+  "entry": "adapters/deliveries/claude-channel.ts",
+  "register": { "kind": "claude-mcp-server", "name": "agentbus-channel" },
+  "launch": "AGENTBUS_NAME=<name> claude --dangerously-load-development-channels server:agentbus-channel"
+}

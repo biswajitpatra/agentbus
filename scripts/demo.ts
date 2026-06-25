@@ -2,9 +2,10 @@
 /**
  * Self-driving demo of agentbus, used to record the README cast.
  *
- * It spawns two REAL adapter processes over stdio and drives them with the MCP
- * client — the same discovery, delivery, and rename the tools do in a live
- * session. Nothing here is faked; only the narration and pacing are scripted.
+ * Each "session" is the two real layers wired together over stdio: the always-on
+ * `agentbus` send server (tools) and the `claude-channel` delivery (receive). We
+ * drive them with the MCP client exactly as a live session would. Nothing is
+ * faked; only the narration and pacing are scripted.
  *
  *   bun scripts/demo.ts
  */
@@ -26,12 +27,19 @@ const say = async (s = '') => { console.log(s); await sleep(700) }
 const text = (r: any) => r.content?.[0]?.text ?? JSON.stringify(r)
 
 function session(name: string, home: string) {
-  const transport = new StdioClientTransport({
-    command: 'bun',
-    args: ['adapters/claude/server.ts'],
-    env: { ...process.env, AGENTBUS_NAME: name, AGENTBUS_HOME: home },
-  })
-  return { client: new Client({ name: `demo-${name}`, version: '0' }), transport }
+  const env = { ...process.env, AGENTBUS_NAME: name, AGENTBUS_HOME: home }
+  const sendT = new StdioClientTransport({ command: 'bun', args: ['adapters/send.ts'], env })
+  const chanT = new StdioClientTransport({ command: 'bun', args: ['adapters/deliveries/claude-channel.ts'], env })
+  const send = new Client({ name: `demo-send-${name}`, version: '0' })
+  const chan = new Client({ name: `demo-chan-${name}`, version: '0' })
+  const inbox: string[] = []
+  chan.fallbackNotificationHandler = async (n: any) => {
+    if (n.method === 'notifications/claude/channel') {
+      const p = n.params
+      inbox.push(`<channel source="agentbus" from="${p.meta.from}" msg_id="${p.meta.msg_id}">\n  ${p.content}\n</channel>`)
+    }
+  }
+  return { send, inbox, connect: () => Promise.all([send.connect(sendT), chan.connect(chanT)]), close: () => Promise.all([send.close(), chan.close()]) }
 }
 
 const home = mkdtempSync(join(tmpdir(), 'agentbus-demo-'))
@@ -39,51 +47,34 @@ const home = mkdtempSync(join(tmpdir(), 'agentbus-demo-'))
 await say(bold('agentbus') + dim(' — two agent sessions talking'))
 await say()
 
-await say(dim('$ ') + 'AGENTBUS_NAME=frontend claude --dangerously-load-development-channels server:agentbus')
-await say(dim('$ ') + 'AGENTBUS_NAME=backend  claude --dangerously-load-development-channels server:agentbus')
+await say(dim('$ ') + 'AGENTBUS_NAME=frontend claude --dangerously-load-development-channels server:agentbus-channel')
+await say(dim('$ ') + 'AGENTBUS_NAME=backend  claude --dangerously-load-development-channels server:agentbus-channel')
 const frontend = session('frontend', home)
 const backend = session('backend', home)
-const inbox: string[] = []
-backend.client.fallbackNotificationHandler = async (n: any) => {
-  if (n.method === 'notifications/claude/channel') {
-    const p = n.params
-    inbox.push(`<channel source="agentbus" from="${p.meta.from}" msg_id="${p.meta.msg_id}">\n  ${p.content}\n</channel>`)
-  }
-}
-await Promise.all([
-  frontend.client.connect(frontend.transport),
-  backend.client.connect(backend.transport),
-])
+await Promise.all([frontend.connect(), backend.connect()])
 await sleep(600)
-await say(green('  ✓ both sessions online'))
+await say(green('  ✓ both online — send (MCP) + claude-channel delivery'))
 await say()
 
 await say(cyan('frontend ▸ ') + 'list_peers')
-await say(dim(text(await frontend.client.callTool({ name: 'list_peers', arguments: {} })).split('\n').map((l: string) => '  ' + l).join('\n')))
+await say(dim(text(await frontend.send.callTool({ name: 'list_peers', arguments: {} })).split('\n').map((l: string) => '  ' + l).join('\n')))
 await say()
 
 await say(cyan('frontend ▸ ') + 'send_message  to=backend  text=' + yellow('"what\'s the shape of GET /users?"'))
-await frontend.client.callTool({ name: 'send_message', arguments: { to: 'backend', text: "what's the shape of GET /users?" } })
+await frontend.send.callTool({ name: 'send_message', arguments: { to: 'backend', text: "what's the shape of GET /users?" } })
 await sleep(800)
-await say(green('  ✓ pushed into backend\'s running session:'))
-await say(dim(inbox[0]?.split('\n').map((l: string) => '  ' + l).join('\n')))
+await say(green('  ✓ delivered into backend\'s running session:'))
+await say(dim(backend.inbox[0]?.split('\n').map((l: string) => '  ' + l).join('\n')))
 await say()
 
 await say(cyan('backend ▸ ') + 'send_message  to=frontend  text=' + yellow('"{ id, name, email }"'))
-await backend.client.callTool({ name: 'send_message', arguments: { to: 'frontend', text: '{ id, name, email }' } })
-await sleep(600)
-await say(green('  ✓ reply delivered'))
+await backend.send.callTool({ name: 'send_message', arguments: { to: 'frontend', text: '{ id, name, email }' } })
+await sleep(800)
+await say(green('  ✓ reply delivered to frontend:'))
+await say(dim(frontend.inbox[0]?.split('\n').map((l: string) => '  ' + l).join('\n')))
 await say()
 
-await say(cyan('backend ▸ ') + 'set_name  name=api')
-await say(dim('  ' + text(await backend.client.callTool({ name: 'set_name', arguments: { name: 'api' } }))))
-await sleep(400)
-await say(cyan('frontend ▸ ') + 'list_peers')
-await say(dim(text(await frontend.client.callTool({ name: 'list_peers', arguments: {} })).split('\n').map((l: string) => '  ' + l).join('\n')))
-await say()
+await say(green('  ✓ send (always-on MCP) + pluggable delivery. ') + dim('github.com/biswajitpatra/agentbus'))
 
-await say(green('  ✓ renamed live — no restart. ') + dim('github.com/biswajitpatra/agentbus'))
-
-await frontend.client.close()
-await backend.client.close()
+await Promise.all([frontend.close(), backend.close()])
 process.exit(0)

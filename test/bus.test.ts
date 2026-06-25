@@ -1,7 +1,10 @@
 /**
- * Integration tests: spawn real server processes over stdio and verify
- * discovery, cross-session delivery, rename, offline queueing, and that
- * concurrent senders never lose or duplicate a message.
+ * Integration tests over real stdio processes, exercising the split layers:
+ *   - send       (adapters/send.ts)                       — the always-on MCP tools
+ *   - delivery   (adapters/deliveries/claude-channel.ts)  — channel receive
+ * A "sender" runs send.ts; a "receiver" runs the channel delivery. We verify
+ * discovery, cross-session delivery, offline queueing, and that concurrent
+ * senders never lose or duplicate a message.
  */
 import { test, expect } from 'bun:test'
 import { openBus } from '../core/bus'
@@ -13,48 +16,42 @@ import { join } from 'path'
 
 const text = (r: any) => JSON.stringify(r)
 
-function session(name: string, home: string) {
+function client(entry: string, name: string, home: string) {
   const transport = new StdioClientTransport({
     command: 'bun',
-    args: ['adapters/claude/server.ts'],
+    args: [entry],
     env: { ...process.env, AGENTBUS_NAME: name, AGENTBUS_HOME: home },
   })
   return { client: new Client({ name: `test-${name}`, version: '0' }), transport }
 }
+const sender = (name: string, home: string) => client('adapters/send.ts', name, home)
+const channel = (name: string, home: string) => client('adapters/deliveries/claude-channel.ts', name, home)
 
-test('discovery + delivery + rename', async () => {
+test('discovery + send + channel delivery', async () => {
   const home = mkdtempSync(join(tmpdir(), 'agentbus-'))
   const received: unknown[] = []
 
-  const alice = session('alice', home)
-  const bob = session('bob', home)
+  const alice = sender('alice', home)
+  const bob = channel('bob', home)
   bob.client.fallbackNotificationHandler = async n => void received.push(n)
 
-  await Promise.all([
-    alice.client.connect(alice.transport),
-    bob.client.connect(bob.transport),
-  ])
-  await Bun.sleep(400) // let both register their presence
+  await Promise.all([alice.client.connect(alice.transport), bob.client.connect(bob.transport)])
+  await Bun.sleep(500) // let presence register
 
   const peers = await alice.client.callTool({ name: 'list_peers', arguments: {} })
   expect(text(peers)).toContain('bob')
 
   await alice.client.callTool({ name: 'send_message', arguments: { to: 'bob', text: 'ping-123' } })
-  await Bun.sleep(900) // wait past the poll interval
+  await Bun.sleep(900)
   expect(text(received)).toContain('notifications/claude/channel')
   expect(text(received)).toContain('ping-123')
   expect(text(received)).toContain('alice') // from attribute
-
-  await alice.client.callTool({ name: 'set_name', arguments: { name: 'apiserver' } })
-  await Bun.sleep(300)
-  const peers2 = await bob.client.callTool({ name: 'list_peers', arguments: {} })
-  expect(text(peers2)).toContain('apiserver')
 
   await alice.client.close()
   await bob.client.close()
 }, 20_000)
 
-test('offline queue drains on startup', async () => {
+test('offline queue drains on channel startup', async () => {
   const home = mkdtempSync(join(tmpdir(), 'agentbus-'))
   const received: unknown[] = []
 
@@ -63,7 +60,7 @@ test('offline queue drains on startup', async () => {
   seed.enqueue('dave', 'carol', 'queued-while-offline')
   seed.close()
 
-  const carol = session('carol', home)
+  const carol = channel('carol', home)
   carol.client.fallbackNotificationHandler = async n => void received.push(n)
   await carol.client.connect(carol.transport)
   await Bun.sleep(900)
@@ -76,12 +73,12 @@ test('concurrent senders never lose or duplicate', async () => {
   const home = mkdtempSync(join(tmpdir(), 'agentbus-'))
   const got: string[] = []
 
-  const rcv = session('rcv', home)
+  const rcv = channel('rcv', home)
   rcv.client.fallbackNotificationHandler = async (n: any) => {
     if (n.method === 'notifications/claude/channel') got.push(n.params.content)
   }
-  const a = session('a', home)
-  const b = session('b', home)
+  const a = sender('a', home)
+  const b = sender('b', home)
   await Promise.all([
     rcv.client.connect(rcv.transport),
     a.client.connect(a.transport),

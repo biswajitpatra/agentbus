@@ -8,7 +8,7 @@ Thanks for your interest in improving agentbus.
 bun install                       # install deps
 bun test                          # run the integration tests
 bun x tsc --noEmit                # typecheck
-bun adapters/claude/server.ts # run the claude adapter standalone (reads AGENTBUS_NAME)
+bun adapters/send.ts              # run the send server standalone (reads AGENTBUS_NAME)
 ```
 
 CI runs typecheck + tests on every push and PR; keep both green.
@@ -20,22 +20,26 @@ CI runs typecheck + tests on every push and PR; keep both green.
   - `core/bus.ts` — SQLite client, migrate-on-startup, all queries.
   - `core/schema.ts` — Drizzle tables (`peers`, `messages`).
 - `triggers/` — Trigger (PULL) implementations: `file-watch`, `poll`.
-- `adapters/<id>/` — a module: the runtime integration + a `module.json`.
-- `cli.ts` — the module manager (`list`/`enable`/`disable`/`doctor`/`uninstall`).
+- `adapters/send.ts` (+ `send.json`) — the always-on MCP send server.
+- `adapters/deliveries/` — one `.ts` + `.json` per pluggable delivery
+  (`claude-channel`, `claude-hook`).
+- `cli.ts` — the manager (`install`/`list`/`enable`/`disable`/`send`/`peers`/
+  `doctor`/`uninstall`).
 - `drizzle/` — generated, versioned SQL migrations (committed).
-- `test/bus.test.ts` — spawns real adapter processes over stdio and asserts
-  discovery, delivery, rename, offline queueing, and no-loss under concurrency.
+- `test/` — spawns real send/delivery processes over stdio and asserts
+  discovery, delivery, offline queueing, no-loss under concurrency, and the hook.
 
 See [SPEC.md](SPEC.md) for the full standard and [README](README.md) for the
 bus design.
 
-## Adding a runtime adapter
+## Adding a delivery
 
-1. Create `adapters/<id>/` with an entry that opens the core bus and wires a
-   `Trigger` + a `Delivery` (see `adapters/claude/server.ts`).
-2. Add `adapters/<id>/module.json` (see [SPEC.md §7](SPEC.md)).
+1. Create `adapters/deliveries/<id>.ts` that opens the core bus and wires a
+   `Trigger` + a `Delivery` (see `claude-channel.ts` for a long-running server,
+   `claude-hook.ts` for a runtime-invoked script).
+2. Add `adapters/deliveries/<id>.json` (see [SPEC.md §7](SPEC.md)).
 3. If it needs a new install mechanism, add a `register.kind` handler in `cli.ts`.
-4. Keep the core untouched — adapters depend on the core, never the reverse.
+4. Keep the core untouched — deliveries depend on the core, never the reverse.
 
 ## Changing the schema
 

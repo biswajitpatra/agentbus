@@ -1,0 +1,8 @@
+{
+  "id": "claude-hook",
+  "title": "Claude — hook (turn-boundary, Stop/SessionStart)",
+  "runtime": "claude-code",
+  "entry": "adapters/deliveries/claude-hook.ts",
+  "register": { "kind": "claude-hook", "events": ["SessionStart", "Stop"] },
+  "launch": "AGENTBUS_NAME=<name> claude"
+}

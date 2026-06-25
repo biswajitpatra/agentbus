@@ -20,28 +20,33 @@ keeps its envelope A2A-shaped so a remote A2A leg can be added as an adapter.
         │  presence registry · durable mailbox ·      │
         │  delivery tracking            (one SQLite db)│
         └───────────────┬───────────────┬─────────────┘
-              PORT: Trigger      PORT: Delivery
-              (pull / wake)        (push into agent)
+              SEND (always-on)    DELIVERY (pluggable, many)
+              MCP tools, notify   Trigger + Delivery ports
         ┌───────────────┴───────────────┴─────────────┐
-        │  MODULE = adapter (Trigger + Delivery) +      │
-        │           module.json manifest                │
+        │  send.json (one, always)  ·  deliveries/*.json │
         └───────────────────────────────────────────────┘
 ```
 
-The **core** owns all shared state and is the single source of truth. It knows
-nothing about MCP, channels, HTTP, or how a recipient is woken. A **module**
-adapts the core to one runtime by providing two driven ports.
+Three layers:
 
-A module may expose several **modes** — alternative (Trigger, Delivery) pairings
-for the same runtime. Modes are **not** mutually exclusive: enable any subset and
-they cooperate through the bus — whichever mechanism drains a pending row first
-delivers it (its `deliveredAt` write), and the others find it gone. Modules are
-independent of each other too, so a Claude module and a future Gemini module can
-be enabled together and message each other over the one shared bus.
+- **core** — owns all shared state and is the single source of truth. Knows
+  nothing about MCP, channels, HTTP, or how a recipient is woken.
+- **send** — one **always-on** MCP server exposing the send/query tools
+  (`send_message`, `broadcast`, `list_peers`, `whoami`) and `notify` (waking a
+  recipient). MCP is universal, so the same send layer works on any MCP-capable
+  CLI. It **never drains** the inbox.
+- **delivery** — how an envelope lands *in* a session, implemented with the two
+  driven ports below (`Trigger` + `Delivery`). Deliveries are **pluggable and
+  independent**: enable any combination, each individually (there is no
+  "enable all"). They cooperate through the bus — whichever drains a pending row
+  first delivers it (its `deliveredAt` write); the others find it gone — so
+  running several together is safe. Different runtimes' deliveries (Claude,
+  Gemini, …) coexist on the one shared bus and can message each other.
 
-The Claude Code module ships `channel` (file-watch + MCP channel — real-time) and
-`hook` (hook lifecycle + `additionalContext` — turn-boundary, and works for
-sessions that can't load channels, e.g. ones dispatched from the agents panel).
+The Claude Code deliveries are `claude-channel` (file-watch + MCP channel —
+real-time) and `claude-hook` (hook lifecycle + `additionalContext` —
+turn-boundary, and works for sessions that can't load channels, e.g. ones
+dispatched from the agents panel).
 
 ## 2. Envelope
 
@@ -117,57 +122,56 @@ The core records `deliveredAt` **only after `deliver()` resolves**. Therefore:
 
 ## 6. Presence
 
-Each session upserts a `peers` row and refreshes `lastSeen` on a heartbeat
-(reference: 15 s). A peer silent past a stale window (reference: 45 s) is treated
-as offline and reaped lazily on the next presence query. Names are unique among
-live peers; a rename moves pending rows to the new name atomically.
+A participating session (one with a name set via `AGENTBUS_NAME`) upserts a
+`peers` row and refreshes `lastSeen` on a heartbeat (reference: 15 s). A peer
+silent past a stale window (reference: 45 s) is treated as offline and reaped
+lazily on the next presence query. The name is fixed for the session's lifetime
+(set at launch). Sending uses mailbox semantics: an envelope may be queued for
+any name, so idle or not-yet-started peers are still reachable.
 
-## 7. Module manifest (`adapters/<id>/module.json`)
+## 7. Manifests
 
-A module declares one or more **modes**; each mode is a (Trigger, Delivery)
-pairing plus how to register it with the runtime.
+The always-on send layer is described by `adapters/send.json`:
 
 ```json
 {
-  "id": "claude",
-  "title": "Claude Code",
-  "runtime": "claude-code",
-  "defaultMode": "channel",
-  "modes": {
-    "channel": {
-      "title": "channel — push, real-time",
-      "delivery": "mcp-channel",
-      "trigger": "file-watch",
-      "entry": "adapters/claude/server.ts",
-      "register": { "kind": "claude-mcp-server", "name": "agentbus" },
-      "launch": "AGENTBUS_NAME=<name> claude --dangerously-load-development-channels server:agentbus"
-    },
-    "hook": {
-      "title": "hook — pull, turn-boundary",
-      "delivery": "hook-additionalContext",
-      "trigger": "claude-hook-lifecycle",
-      "entry": "adapters/claude/drain.ts",
-      "register": { "kind": "claude-hook", "events": ["SessionStart", "Stop"] },
-      "launch": "AGENTBUS_NAME=<name> claude"
-    }
-  }
+  "id": "send",
+  "title": "MCP send tools (core + push)",
+  "runtime": "any-mcp",
+  "always": true,
+  "entry": "adapters/send.ts",
+  "register": { "kind": "claude-mcp-server", "name": "agentbus" }
 }
 ```
 
-`agentbus enable <id> [mode]` turns on a mode (omit = `defaultMode`, `all` =
-every mode); enabling one does not disable the others. `register.kind` tells the
-manager how to install that mode: `claude-mcp-server` writes an MCP server to
-`~/.claude.json`; `claude-hook` writes hooks to `~/.claude/settings.json`. New
-kinds are added as new runtimes/transports are supported.
+Each pluggable delivery is one file under `adapters/deliveries/`:
+
+```json
+{
+  "id": "claude-channel",
+  "title": "Claude — channel (real-time, file-watch + MCP channel)",
+  "runtime": "claude-code",
+  "entry": "adapters/deliveries/claude-channel.ts",
+  "register": { "kind": "claude-mcp-server", "name": "agentbus-channel" },
+  "launch": "AGENTBUS_NAME=<name> claude --dangerously-load-development-channels server:agentbus-channel"
+}
+```
+
+`agentbus enable <delivery>` turns on exactly one delivery (and ensures `send` is
+registered); there is deliberately **no "enable all"**. `register.kind` tells the
+manager how to install it: `claude-mcp-server` writes an MCP server to
+`~/.claude.json`; `claude-hook` writes `SessionStart`/`Stop` hooks to
+`~/.claude/settings.json`. New kinds are added as new runtimes/transports are
+supported (e.g. an A2A delivery POSTing to a webhook).
 
 ## 8. Conformance
 
-A conformant module:
+A conformant delivery:
 
 1. Reads/writes only through the core API (no direct schema coupling).
 2. Implements `Trigger` and `Delivery` per §3–4.
 3. Marks an envelope delivered only after a successful push (§5).
-4. Ships a `module.json` with at least one mode (§7).
+4. Ships a manifest under `adapters/deliveries/` (§7).
 
 ## 9. Relationship to other protocols
 
