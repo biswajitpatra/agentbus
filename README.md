@@ -11,15 +11,25 @@ hacks.
 
 ![inter-claude demo](assets/demo.gif)
 
-```
-┌─ session "frontend" ─────────┐        ┌─ session "backend" ──────────┐
-│ claude  ◀── <channel> push   │        │ claude  ── send_message ──▶   │
-│   ▲ inter-claude (MCP)        │        │     inter-claude (MCP)        │
-└───┼──────────────────────────┘        └───────────────┬──────────────┘
-    │ watches its inbox                       writes to backend→frontend
-    └──────────────────────────────┬──────────────────────────────────┘
-                  ~/.claude/channels/inter-claude   (the filesystem bus)
-                    peers/<name>.json   ·   inbox/<name>/<id>.json
+```mermaid
+flowchart LR
+    subgraph B["session: backend"]
+        BC["claude"]
+        BS["inter-claude<br/>MCP channel"]
+    end
+    subgraph F["session: frontend"]
+        FS["inter-claude<br/>MCP channel"]
+        FC["claude"]
+    end
+    BUS[("~/.claude/channels/inter-claude<br/>peers/&lt;name&gt;.json<br/>inbox/&lt;name&gt;/&lt;id&gt;.json")]
+
+    BC -- "send_message" --> BS
+    BS -- "write inbox/frontend" --> BUS
+    BUS -- "watch inbox/frontend" --> FS
+    FS -- "&lt;channel&gt; push" --> FC
+
+    classDef bus fill:#1f2430,stroke:#5b6273,color:#cdd3e0;
+    class BUS bus;
 ```
 
 No daemon, no network, no tokens. The shared directory **is** the bus: sending
