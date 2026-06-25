@@ -23,19 +23,15 @@ import { DB_PATH } from '../../core/paths'
 
 const sanitize = (s: string) => s.toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32)
 
-const input = (await Bun.stdin.json().catch(() => ({}))) as {
-  hook_event_name?: string
-  session_id?: string
-}
+const input = (await Bun.stdin.json().catch(() => ({}))) as { hook_event_name?: string }
 const event = input.hook_event_name ?? 'Stop'
 
-// Identify this session. AGENTBUS_NAME (set at launch) is preferred; fall back to
-// a stable short id from the Claude Code session id. A hook-only session can't
-// rename itself (no MCP tools), so this name is fixed for its lifetime.
-const name =
-  sanitize(process.env.AGENTBUS_NAME ?? '') ||
-  (input.session_id ? `s-${sanitize(input.session_id).slice(0, 6)}` : '')
-if (!name) process.exit(0) // can't tell who we are — do nothing
+// Opt-in by AGENTBUS_NAME. The hook is registered globally (it fires for every
+// Claude session), so without an explicit name we do nothing — unrelated sessions
+// never join the bus. A hook-only session can't rename itself (no MCP tools), so
+// this name is fixed for its lifetime; set it at launch.
+const name = sanitize(process.env.AGENTBUS_NAME ?? '')
+if (!name) process.exit(0)
 
 const bus = openBus(DB_PATH)
 try {
