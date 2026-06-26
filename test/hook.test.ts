@@ -42,3 +42,22 @@ test('hook stays silent when the inbox is empty', async () => {
   const out = await runHook(home, 'lonely')
   expect(out.trim()).toBe('') // no output → normal stop, no forced continuation
 }, 20_000)
+
+test('hook announces identity for a dispatched agent on SessionStart', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'agentbus-hook-'))
+  const proc = Bun.spawn(['bun', 'adapters/deliveries/claude-hook.ts'], {
+    env: { ...process.env, AGENTBUS_NAME: '', CLAUDE_SESSION_ID: '', AGENTBUS_HOME: home },
+    stdin: new TextEncoder().encode(JSON.stringify({
+      hook_event_name: 'SessionStart', session_id: 'sess999', agent_id: 'a1', agent_type: 'researcher',
+    })),
+    stdout: 'pipe',
+  })
+  const out = await new Response(proc.stdout).text()
+  await proc.exited
+  const parsed = JSON.parse(out)
+  expect(parsed.hookSpecificOutput.additionalContext).toContain('you are "researcher"')
+
+  const bus = openBus(join(home, 'bus.db'))
+  expect(bus.idForName('researcher')).toBe('claude:sess999') // registered from session_id
+  bus.close()
+}, 20_000)

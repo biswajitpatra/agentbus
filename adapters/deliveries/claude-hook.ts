@@ -44,13 +44,21 @@ try {
     `agent-${token.slice(0, 6)}`
   bus.setName(name, myId)
 
-  // 2. deliver: drain pending into additionalContext.
+  // 2. deliver: announce identity (agents, on SessionStart) + drain pending.
+  const parts: string[] = []
+  if (event === 'SessionStart' && isAgent) {
+    parts.push(
+      `agentbus: you are "${name}" on the local agent bus. ` +
+      `To message another session, use the send_message tool with from="${name}" ` +
+      `(or run \`agentbus send <to> "..."\` in Bash).`,
+    )
+  }
   const pending = bus.pending(myId)
-  if (pending.length) {
-    const ctx = pending
-      .map(m => `<channel source="agentbus" from="${bus.displayName(m.sender)}" msg_id="${m.id}">\n${m.body}\n</channel>`)
-      .join('\n')
-    console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: ctx } }))
+  parts.push(
+    ...pending.map(m => `<channel source="agentbus" from="${bus.displayName(m.sender)}" msg_id="${m.id}">\n${m.body}\n</channel>`),
+  )
+  if (parts.length) {
+    console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: parts.join('\n') } }))
     for (const m of pending) bus.markDelivered(m.id)
   }
 } finally {

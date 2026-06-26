@@ -105,3 +105,27 @@ test('concurrent senders never lose or duplicate', async () => {
 
   await Promise.all([rcvSend.client.close(), rcvChan.client.close(), a.client.close(), b.client.close()])
 }, 30_000)
+
+test('send_message with explicit from attributes the sender by name', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'agentbus-'))
+  const received: unknown[] = []
+
+  const seed = openBus(join(home, 'bus.db'))
+  seed.setName('bob', 'claude:bob') // a registered identity to send "as"
+  seed.close()
+
+  const alice = send('alice', home) // has its own id, but we override `from`
+  const rcvSend = send('rcv', home) // registers name "rcv"
+  const rcvChan = channel('rcv', home)
+  rcvChan.client.fallbackNotificationHandler = async n => void received.push(n)
+  await Promise.all([alice.client.connect(alice.transport), rcvSend.client.connect(rcvSend.transport), rcvChan.client.connect(rcvChan.transport)])
+  await Bun.sleep(600)
+
+  await alice.client.callTool({ name: 'send_message', arguments: { to: 'rcv', text: 'from-bob', from: 'bob' } })
+  await Bun.sleep(900)
+  expect(text(received)).toContain('from-bob')
+  expect(text(received)).toContain('"from":"bob"') // attributed to bob, not alice
+  expect(text(received)).not.toContain('"from":"alice"')
+
+  await Promise.all([alice.client.close(), rcvSend.client.close(), rcvChan.client.close()])
+}, 25_000)

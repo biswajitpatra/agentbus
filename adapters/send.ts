@@ -40,9 +40,18 @@ function targetId(to: string): string {
   throw new Error(`no peer named "${to}" (try list_peers)`)
 }
 
-function sendToId(toId: string, text: string): number {
-  if (toId === myId) throw new Error('cannot send to self')
-  const id = bus.enqueue(myId ?? 'anon', toId, text)
+// Resolve the sender id. Defaults to this server's own id, but a session that
+// can't self-identify (a dispatched agent, whose MCP server isn't told the
+// session id) may pass `from` = its registered name; we resolve it to an id.
+function resolveFrom(from?: string): string {
+  if (!from) return myId ?? 'anon'
+  const n = sanitizeName(from)
+  return bus.idForName(n) ?? (from.includes(':') ? from : `anon:${n}`)
+}
+
+function sendToId(fromId: string, toId: string, text: string): number {
+  if (toId === fromId) throw new Error('cannot send to self')
+  const id = bus.enqueue(fromId, toId, text)
   trigger.notify(idKey(toId)) // wake a live delivery now (no-op for pollers)
   return id
 }
@@ -61,15 +70,19 @@ const mcp = new McpServer(
 const ok = (text: string) => ({ content: [{ type: 'text' as const, text }] })
 
 mcp.registerTool('send_message',
-  { description: 'Send a message to one peer by name (or id).', inputSchema: { to: z.string(), text: z.string() } },
-  async ({ to, text }) => ok(`sent to ${to} (#${sendToId(targetId(to), text)})`),
+  {
+    description: 'Send a message to one peer by name (or id). Pass `from` (your registered name) if this session has no id of its own — e.g. a dispatched agent.',
+    inputSchema: { to: z.string(), text: z.string(), from: z.string().optional() },
+  },
+  async ({ to, text, from }) => ok(`sent to ${to} (#${sendToId(resolveFrom(from), targetId(to), text)})`),
 )
 
 mcp.registerTool('broadcast',
-  { description: 'Send a message to every other online peer.', inputSchema: { text: z.string() } },
-  async ({ text }) => {
-    const targets = bus.livePeers(STALE_MS).filter(p => p.id !== myId)
-    for (const p of targets) sendToId(p.id, text)
+  { description: 'Send a message to every other online peer.', inputSchema: { text: z.string(), from: z.string().optional() } },
+  async ({ text, from }) => {
+    const fromId = resolveFrom(from)
+    const targets = bus.livePeers(STALE_MS).filter(p => p.id !== fromId)
+    for (const p of targets) sendToId(fromId, p.id, text)
     return ok(`broadcast to ${targets.length} peer(s): ${targets.map(p => p.name).join(', ') || '(none)'}`)
   },
 )
@@ -95,7 +108,7 @@ mcp.registerTool('set_name',
     const name = sanitizeName(raw)
     if (!name) throw new Error('name must contain a-z, 0-9, _ or -')
     const prev = bus.setName(name, myId)
-    if (prev) sendToId(prev, `(agentbus) the name "${name}" was reassigned away from you`)
+    if (prev) sendToId(myId, prev, `(agentbus) the name "${name}" was reassigned away from you`)
     return ok(`registered as ${name}`)
   },
 )
