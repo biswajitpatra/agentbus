@@ -55,9 +55,9 @@ test('hook announces identity for a dispatched agent on SessionStart', async () 
   const out = await new Response(proc.stdout).text()
   await proc.exited
   const parsed = JSON.parse(out)
-  expect(parsed.hookSpecificOutput.additionalContext).toContain('you are "researcher"')
+  expect(parsed.hookSpecificOutput.additionalContext).toContain('you are "researcher-') // <type>-<sid> auto-name
 
   const bus = openBus(join(home, 'bus.db'))
-  expect(bus.idForName('researcher')).toBe('claude:sess999') // registered from session_id
+  expect(bus.displayName('claude:sess999')).toMatch(/^researcher-/) // registered from session_id, suffixed
   bus.close()
 }, 20_000)
