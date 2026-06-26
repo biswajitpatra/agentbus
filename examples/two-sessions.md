@@ -78,7 +78,7 @@ bun run agentbus doctor   # runtime, what's enabled, live peers, pending/deliver
 
 # the bus is just SQLite:
 DB=~/.agentbus/bus.db
-sqlite3 "$DB" "SELECT name, pid, last_seen FROM peers;"
+sqlite3 "$DB" "SELECT n.name, i.id, i.session_id, i.last_seen FROM names n JOIN identities i ON n.id=i.id;"
 sqlite3 "$DB" "SELECT sender, recipient, body, delivered_at FROM messages ORDER BY id DESC LIMIT 10;"
 ```
 

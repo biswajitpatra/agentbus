@@ -1,3 +1,11 @@
+CREATE TABLE `identities` (
+	`id` text PRIMARY KEY NOT NULL,
+	`session_id` text,
+	`pid` integer NOT NULL,
+	`started_at` integer NOT NULL,
+	`last_seen` integer NOT NULL
+);
+--> statement-breakpoint
 CREATE TABLE `messages` (
 	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
 	`sender` text NOT NULL,
@@ -8,9 +16,8 @@ CREATE TABLE `messages` (
 );
 --> statement-breakpoint
 CREATE INDEX `idx_inbox` ON `messages` (`recipient`,`delivered_at`);--> statement-breakpoint
-CREATE TABLE `peers` (
+CREATE TABLE `names` (
 	`name` text PRIMARY KEY NOT NULL,
-	`pid` integer NOT NULL,
-	`started_at` integer NOT NULL,
-	`last_seen` integer NOT NULL
+	`id` text NOT NULL,
+	`updated_at` integer NOT NULL
 );

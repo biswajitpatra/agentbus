@@ -1,11 +1,12 @@
 /**
- * The bus: all shared state (peers + messages) in one SQLite database, accessed
- * through Drizzle. Pending migrations are applied on open, so a freshly shipped
- * schema change upgrades the store automatically.
+ * The bus: all shared state in one SQLite database, accessed through Drizzle.
+ * Pending migrations are applied on open.
  *
- * This module is runtime-agnostic: it knows nothing about MCP, channels, or how
- * a message reaches a session (that is the Delivery port) or how a recipient is
- * woken (that is the Trigger port). It is purely presence + a durable mailbox.
+ * Two concerns live here, both runtime-agnostic:
+ *   - the registry: identities (stable id <-> live Claude session) + names
+ *     (mutable label -> id) + presence.
+ *   - the mailbox: messages keyed by recipient *id*, with delivery tracking.
+ * It knows nothing about MCP, channels, hooks, or how a recipient is woken.
  */
 import { Database } from 'bun:sqlite'
 import { drizzle } from 'drizzle-orm/bun-sqlite'
@@ -13,21 +14,19 @@ import { migrate } from 'drizzle-orm/bun-sqlite/migrator'
 import { and, asc, eq, gte, isNotNull, isNull, lt } from 'drizzle-orm'
 import { mkdirSync, openSync, closeSync, rmSync } from 'fs'
 import { dirname, join } from 'path'
-import { messages, peers, type Message, type Peer } from './schema'
+import { identities, names, messages, type Identity, type Message, type NameRow } from './schema'
 
-export type { Message, Peer }
+export type { Identity, Message, NameRow }
+export type LivePeer = { name: string; id: string }
 
-// Serialize cross-process init (the WAL switch + migrations) on a fresh DB with
-// an exclusive lock file, so concurrently-started sessions don't collide.
 function withInitLock(dbPath: string, fn: () => void): void {
   const lock = `${dbPath}.init.lock`
   const start = Date.now()
   for (;;) {
     let fd: number
-    try {
-      fd = openSync(lock, 'wx') // O_CREAT|O_EXCL — fails if another process holds it
-    } catch {
-      if (Date.now() - start > 20_000) { try { rmSync(lock) } catch {} } // steal a stale lock
+    try { fd = openSync(lock, 'wx') }
+    catch {
+      if (Date.now() - start > 20_000) { try { rmSync(lock) } catch {} }
       Bun.sleepSync(25)
       continue
     }
@@ -42,11 +41,8 @@ function withInitLock(dbPath: string, fn: () => void): void {
 export function openBus(dbPath: string) {
   mkdirSync(dirname(dbPath), { recursive: true })
   const sqlite = new Database(dbPath, { create: true })
-  sqlite.exec('PRAGMA busy_timeout = 10000;') // per-connection: wait on locks, don't fail
+  sqlite.exec('PRAGMA busy_timeout = 10000;')
   const db = drizzle({ client: sqlite })
-
-  // Only one process sets WAL + runs migrations at a time; the rest wait, then
-  // find WAL already on and migrations already applied (both no-ops).
   withInitLock(dbPath, () => {
     sqlite.exec('PRAGMA journal_mode = WAL;')
     migrate(db, { migrationsFolder: join(import.meta.dir, '..', 'drizzle') })
@@ -55,57 +51,76 @@ export function openBus(dbPath: string) {
   const now = () => Date.now()
 
   return {
-    // --- presence / discovery ---
-    registerPeer(name: string, pid: number) {
+    // --- registry: identities (presence) ---
+    registerIdentity(id: string, sessionId: string | null, pid: number) {
       const t = now()
-      db.insert(peers).values({ name, pid, startedAt: t, lastSeen: t })
-        .onConflictDoUpdate({ target: peers.name, set: { pid, startedAt: t, lastSeen: t } }).run()
+      db.insert(identities).values({ id, sessionId, pid, startedAt: t, lastSeen: t })
+        .onConflictDoUpdate({ target: identities.id, set: { sessionId, pid, lastSeen: t } }).run()
     },
-    heartbeat(name: string, pid: number) {
+    heartbeat(id: string, sessionId: string | null, pid: number) {
       const t = now()
-      db.insert(peers).values({ name, pid, startedAt: t, lastSeen: t })
-        .onConflictDoUpdate({ target: peers.name, set: { lastSeen: t } }).run()
+      db.insert(identities).values({ id, sessionId, pid, startedAt: t, lastSeen: t })
+        .onConflictDoUpdate({ target: identities.id, set: { lastSeen: t, ...(sessionId ? { sessionId } : {}) } }).run()
     },
-    unregisterPeer(name: string) {
-      db.delete(peers).where(eq(peers.name, name)).run()
+    unregisterIdentity(id: string) {
+      db.delete(identities).where(eq(identities.id, id)).run()
     },
-    livePeers(staleMs: number): Peer[] {
-      const cut = now() - staleMs
-      db.delete(peers).where(lt(peers.lastSeen, cut)).run() // reap silent peers
-      return db.select().from(peers).where(gte(peers.lastSeen, cut)).orderBy(asc(peers.name)).all()
+    isLiveId(id: string, staleMs: number): boolean {
+      return db.select().from(identities)
+        .where(and(eq(identities.id, id), gte(identities.lastSeen, now() - staleMs))).get() != null
     },
-    isLive(name: string, staleMs: number): boolean {
-      return db.select().from(peers)
-        .where(and(eq(peers.name, name), gte(peers.lastSeen, now() - staleMs))).get() != null
+    sessionThread(id: string): string | null {
+      return db.select().from(identities).where(eq(identities.id, id)).get()?.sessionId ?? null
     },
 
-    // --- messages (the durable mailbox) ---
-    enqueue(sender: string, recipient: string, body: string): number {
+    // --- registry: names (mutable label -> id) ---
+    // Override semantics: returns the previous holder's id (or null) so the
+    // caller can notify it. Drops the caller's other names (rename = one label).
+    setName(name: string, id: string): string | null {
+      const prev = db.select().from(names).where(eq(names.name, name)).get()?.id ?? null
+      db.delete(names).where(eq(names.id, id)).run()
+      db.insert(names).values({ name, id, updatedAt: now() })
+        .onConflictDoUpdate({ target: names.name, set: { id, updatedAt: now() } }).run()
+      return prev && prev !== id ? prev : null
+    },
+    idForName(name: string): string | null {
+      return db.select().from(names).where(eq(names.name, name)).get()?.id ?? null
+    },
+    displayName(id: string): string {
+      return db.select().from(names).where(eq(names.id, id)).orderBy(asc(names.name)).get()?.name ?? id
+    },
+    // live peers = names whose identity is still live (for list_peers)
+    livePeers(staleMs: number): LivePeer[] {
+      const cut = now() - staleMs
+      db.delete(identities).where(lt(identities.lastSeen, cut)).run() // reap stale
+      const live = db.select().from(identities).where(gte(identities.lastSeen, cut)).all()
+      const liveIds = new Set(live.map(i => i.id))
+      return db.select().from(names).orderBy(asc(names.name)).all()
+        .filter(n => liveIds.has(n.id))
+        .map(n => ({ name: n.name, id: n.id }))
+    },
+
+    // --- mailbox: messages keyed by recipient id ---
+    enqueue(senderId: string, recipientId: string, body: string): number {
       const [row] = db.insert(messages)
-        .values({ sender, recipient, body, createdAt: now() })
+        .values({ sender: senderId, recipient: recipientId, body, createdAt: now() })
         .returning({ id: messages.id }).all()
       return row.id
     },
-    pending(recipient: string): Message[] {
+    pending(recipientId: string): Message[] {
       return db.select().from(messages)
-        .where(and(eq(messages.recipient, recipient), isNull(messages.deliveredAt)))
+        .where(and(eq(messages.recipient, recipientId), isNull(messages.deliveredAt)))
         .orderBy(asc(messages.id)).all()
     },
     markDelivered(id: number) {
       db.update(messages).set({ deliveredAt: now() }).where(eq(messages.id, id)).run()
-    },
-    reassignPending(from: string, to: string) {
-      db.update(messages).set({ recipient: to })
-        .where(and(eq(messages.recipient, from), isNull(messages.deliveredAt))).run()
     },
     prune(ttlMs: number) {
       db.delete(messages)
         .where(and(isNotNull(messages.deliveredAt), lt(messages.deliveredAt, now() - ttlMs))).run()
     },
 
-    close() {
-      sqlite.close()
-    },
+    close() { sqlite.close() },
   }
 }
 

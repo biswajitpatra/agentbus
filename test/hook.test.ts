@@ -1,8 +1,7 @@
 /**
- * Tests for the claude `hook` (pull) delivery mode: the drain script should read
- * a session's pending messages, emit them as hookSpecificOutput.additionalContext,
- * mark them delivered, and stay silent when the inbox is empty (so it never forces
- * the turn to continue for nothing).
+ * Tests for the claude-hook delivery: it registers the identity (from the
+ * resolved id) and drains pending messages into hookSpecificOutput.additionalContext,
+ * staying silent when the inbox is empty.
  */
 import { test, expect } from 'bun:test'
 import { openBus } from '../core/bus'
@@ -19,24 +18,26 @@ function runHook(home: string, name: string) {
   return new Response(proc.stdout).text().then(async out => { await proc.exited; return out })
 }
 
-test('hook mode drains pending into additionalContext and marks delivered', async () => {
+test('hook registers + drains pending into additionalContext, marks delivered', async () => {
   const home = mkdtempSync(join(tmpdir(), 'agentbus-hook-'))
   const seed = openBus(join(home, 'bus.db'))
-  seed.enqueue('frontend', 'backend', 'hook-hello')
+  seed.setName('frontend', 'claude:frontend') // so the from shows a name
+  seed.enqueue('claude:frontend', 'claude:backend', 'hook-hello')
   seed.close()
 
-  const out = await runHook(home, 'backend')
+  const out = await runHook(home, 'backend') // id resolves to claude:backend
   const parsed = JSON.parse(out)
   expect(parsed.hookSpecificOutput.hookEventName).toBe('Stop')
   expect(parsed.hookSpecificOutput.additionalContext).toContain('hook-hello')
   expect(parsed.hookSpecificOutput.additionalContext).toContain('from="frontend"')
 
   const check = openBus(join(home, 'bus.db'))
-  expect(check.pending('backend').length).toBe(0) // marked delivered after emit
+  expect(check.pending('claude:backend').length).toBe(0) // marked delivered
+  expect(check.idForName('backend')).toBe('claude:backend') // hook registered the name
   check.close()
 }, 20_000)
 
-test('hook mode stays silent when the inbox is empty', async () => {
+test('hook stays silent when the inbox is empty', async () => {
   const home = mkdtempSync(join(tmpdir(), 'agentbus-hook-'))
   const out = await runHook(home, 'lonely')
   expect(out.trim()).toBe('') // no output → normal stop, no forced continuation

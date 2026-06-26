@@ -18,7 +18,8 @@ CI runs typecheck + tests on every push and PR; keep both green.
 - `core/` — the runtime-agnostic bus and the port contracts. Start here.
   - `core/ports.ts` — the standard: `Envelope`, `Trigger`, `Delivery`.
   - `core/bus.ts` — SQLite client, migrate-on-startup, all queries.
-  - `core/schema.ts` — Drizzle tables (`peers`, `messages`).
+  - `core/schema.ts` — Drizzle tables (`identities`, `names`, `messages`).
+  - `core/identity.ts` — id resolution (`<runtime>:<token>`) + name sanitizing.
 - `triggers/` — Trigger (PULL) implementations: `file-watch`, `poll`.
 - `adapters/send.ts` (+ `send.json`) — the always-on MCP send server.
 - `adapters/deliveries/` — one `.ts` + `.json` per pluggable delivery

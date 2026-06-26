@@ -2,45 +2,56 @@
 /**
  * delivery: claude-hook — turn-boundary inbound for Claude Code (agentbus).
  *
- * Where claude-channel is a long-running server that PUSHES messages mid-turn via
- * the channels API, this is the opposite shape: a short-lived script that Claude
- * Code invokes at a lifecycle boundary (SessionStart, Stop). On each invocation it
- * reads this session's pending messages and injects them as `additionalContext`,
- * then marks them delivered — a PULL at the turn boundary. Sending is unaffected:
- * that's the always-on `agentbus` send server.
+ * The Claude Code Stop/SessionStart hook. It does two separable things:
+ *   1. registration — for a dispatched agent there's no env to set and no
+ *      always-on send server doing it, so the hook is the registrar: it reads
+ *      `session_id` (and agent_id) from stdin, resolves the id, and upserts the
+ *      identity (stamping the runtime session id) + a name.
+ *   2. delivery — drains this id's pending messages and injects them as
+ *      `additionalContext`, then marks them delivered.
  *
- * The win: it needs NO channel flag, so it reaches sessions that can't load
- * channels (e.g. ones dispatched from the agents panel). The cost: messages
- * arrive only at turn boundaries, not in real time.
- *
- * Registered in ~/.claude/settings.json by `agentbus enable claude-hook`.
+ * Works with no channel flag, so it reaches sessions dispatched from the agents
+ * panel. Registered in ~/.claude/settings.json by `agentbus enable claude-hook`.
  */
 import { openBus } from '../../core/bus'
 import { DB_PATH } from '../../core/paths'
+import { resolveId, resolveToken, sanitizeName } from '../../core/identity'
 
-const sanitize = (s: string) => s.toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32)
-
-const input = (await Bun.stdin.json().catch(() => ({}))) as { hook_event_name?: string }
+const input = (await Bun.stdin.json().catch(() => ({}))) as {
+  hook_event_name?: string
+  session_id?: string
+  agent_id?: string
+  agent_type?: string
+}
 const event = input.hook_event_name ?? 'Stop'
 
-// Opt-in by AGENTBUS_NAME. The hook is registered globally (it fires for every
-// Claude session), so without an explicit name we do nothing — unrelated sessions
-// never join the bus. A hook-only session can't rename itself (no MCP tools), so
-// this name is fixed for its lifetime; set it at launch.
-const name = sanitize(process.env.AGENTBUS_NAME ?? '')
-if (!name) process.exit(0)
+const token = resolveToken(input.session_id)
+const myId = token ? `claude:${token}` : null
+
+// Participate when named (interactive + hook) OR when this is a dispatched agent
+// (it has an agent_id). A plain, unnamed interactive session does nothing — no
+// auto-join noise.
+const isAgent = Boolean(input.agent_id)
+if (!myId || !(process.env.AGENTBUS_NAME || isAgent)) process.exit(0)
 
 const bus = openBus(DB_PATH)
 try {
-  bus.heartbeat(name, process.pid) // presence: live while the session is active
-  const pending = bus.pending(name)
+  // 1. register: identity + the runtime's live session id + a discoverable name.
+  bus.registerIdentity(myId, input.session_id ?? null, process.pid)
+  const name =
+    sanitizeName(process.env.AGENTBUS_NAME ?? '') ||
+    sanitizeName(input.agent_type ?? '') ||
+    `agent-${token.slice(0, 6)}`
+  bus.setName(name, myId)
+
+  // 2. deliver: drain pending into additionalContext.
+  const pending = bus.pending(myId)
   if (pending.length) {
     const ctx = pending
-      .map(m => `<channel source="agentbus" from="${m.sender}" msg_id="${m.id}">\n${m.body}\n</channel>`)
+      .map(m => `<channel source="agentbus" from="${bus.displayName(m.sender)}" msg_id="${m.id}">\n${m.body}\n</channel>`)
       .join('\n')
-    // Exit 0 with this output → Claude continues and sees the messages.
     console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: ctx } }))
-    for (const m of pending) bus.markDelivered(m.id) // "gone" only after we emit it
+    for (const m of pending) bus.markDelivered(m.id)
   }
 } finally {
   bus.close()

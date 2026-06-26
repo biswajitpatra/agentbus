@@ -27,14 +27,17 @@ keeps its envelope A2A-shaped so a remote A2A leg can be added as an adapter.
         └───────────────────────────────────────────────┘
 ```
 
-Three layers:
+Layers:
 
 - **core** — owns all shared state and is the single source of truth. Knows
-  nothing about MCP, channels, HTTP, or how a recipient is woken.
+  nothing about MCP, channels, HTTP, or how a recipient is woken. It includes
+  the **registry** (§6): stable identities, the mutable name→id map, and presence.
 - **send** — one **always-on** MCP server exposing the send/query tools
-  (`send_message`, `broadcast`, `list_peers`, `whoami`) and `notify` (waking a
-  recipient). MCP is universal, so the same send layer works on any MCP-capable
-  CLI. It **never drains** the inbox.
+  (`send_message`, `broadcast`, `list_peers`, `whoami`, `set_name`) and `notify`
+  (waking a recipient). MCP is universal, so the same send layer works on any
+  MCP-capable CLI. It **never drains** the inbox. For a *named* session it also
+  registers its identity (registration is a concern of the registry, invoked by
+  whoever can establish the id — the send server, or the hook for agents).
 - **delivery** — how an envelope lands *in* a session, implemented with the two
   driven ports below (`Trigger` + `Delivery`). Deliveries are **pluggable and
   independent**: enable any combination, each individually (there is no
@@ -50,18 +53,20 @@ dispatched from the agents panel).
 
 ## 2. Envelope
 
-The unit of exchange. Field names mirror A2A's message shape (a sender, a
-recipient, a text part) so bridging is a mapping, not a redesign.
+The unit of exchange. Routing keys on the stable **identity id**, not the name —
+that's what makes renaming free. A name is resolved to an id at send time.
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `id` | integer | Monotonic, assigned by the core on enqueue. |
-| `from` | string | Sender peer name. |
-| `to` | string | Recipient peer name. `*` is fanned out to one envelope per live peer at enqueue time. |
+| `id` | integer | Monotonic message id, assigned by the core on enqueue. |
+| `from` | string | Sender **identity id**. A delivery shows `displayName(from)` to the agent. |
+| `to` | string | Recipient **identity id** (resolved from a name at send time). |
 | `body` | string | The text part. |
 | `createdAt` | integer | Epoch milliseconds, assigned by the core. |
 
-Peer names are `[a-z0-9_-]{1,32}`.
+Identity ids are `<runtime>:<token>` (e.g. `claude:frontend`). Names are
+`[a-z0-9_-]{1,32}`. Field names mirror A2A's message shape so an A2A bridge is a
+mapping, not a redesign.
 
 ## 3. Port: Trigger (PULL)
 
@@ -120,14 +125,32 @@ The core records `deliveredAt` **only after `deliver()` resolves**. Therefore:
 - **Never lost on transport failure.** A rejected `deliver()` leaves the row
   pending for the next attempt.
 
-## 6. Presence
+## 6. Registry — identities, names, presence
 
-A participating session (one with a name set via `AGENTBUS_NAME`) upserts a
-`peers` row and refreshes `lastSeen` on a heartbeat (reference: 15 s). A peer
-silent past a stale window (reference: 45 s) is treated as offline and reaped
-lazily on the next presence query. The name is fixed for the session's lifetime
-(set at launch). Sending uses mailbox semantics: an envelope may be queued for
-any name, so idle or not-yet-started peers are still reachable.
+The registry is the part of core that answers "who is who," kept separate from
+delivery.
+
+**Identity.** `id = <runtime>:<token>`, where `token` is the first available of
+`AGENTBUS_NAME` (named interactive session), `CLAUDE_SESSION_ID` (Bash-tool
+subprocesses, so the CLI resolves the same id), or a runtime session id the
+delivery supplies (the hook reads `session_id` from stdin for dispatched agents,
+where no env can be set). Every component resolves the id the same way, so they
+agree. The `identities` row also carries the runtime's live `session_id`
+(stamped by the delivery), giving a bidirectional **id ↔ session-thread** link
+that survives the runtime reusing/rotating its own session id.
+
+**Registration** happens wherever the id can be established — the send server
+for a named session, the hook for a dispatched agent — *not* in each delivery.
+It upserts the identity and refreshes `lastSeen` on a heartbeat (reference: 15 s,
+or per-turn for the hook). Silent past a stale window (45 s) ⇒ reaped.
+
+**Names** are a mutable `name → id` map; `name` is unique. `set_name`/
+`register_name` claims a name for your id — re-registering an existing name
+**overrides** it (takes it from the previous holder, who is notified). Renaming
+edits only this map: **messages never move**, because they're keyed by id.
+
+**Sending** uses mailbox semantics — an envelope may be queued for any id, so
+idle or not-yet-started peers are still reachable; it drains when they next run.
 
 ## 7. Manifests
 

@@ -9,19 +9,24 @@ session** as a `<channel>` event. No copy-paste, no daemon, no network.
 
 ![agentbus demo](assets/demo.gif)
 
-agentbus is three layers (see **[SPEC.md](SPEC.md)**):
+agentbus is a few clean layers (see **[SPEC.md](SPEC.md)**):
 
-1. **core** — the bus: one SQLite db (`~/.agentbus/bus.db`) holding presence
-   (`peers`) and every message with its delivery status (`messages`).
-2. **send (MCP) — always on.** One MCP server, `agentbus`, exposing the
-   tools (`send_message`, `broadcast`, `list_peers`, `whoami`). Universal:
-   every CLI speaks MCP. It never drains the inbox.
+1. **core** — the bus: one SQLite db (`~/.agentbus/bus.db`). Includes the
+   **registry**: stable `identities` (`<runtime>:<token>`, with a live
+   `session_id`), a mutable `names` (name → id) map, and `messages` keyed by the
+   recipient **id**.
+2. **send (MCP) — always on.** One MCP server, `agentbus`: `send_message`,
+   `broadcast`, `list_peers`, `whoami`, `set_name`. Universal — every CLI speaks
+   MCP. Never drains. For a named session it also registers its identity.
 3. **delivery — pluggable, you pick.** How messages land *in* a session.
-   Enable the ones you want, individually:
+   Enable individually:
    - `claude-channel` — real-time, mid-turn (file-watch + MCP channel push)
-   - `claude-hook` — turn-boundary (Stop/SessionStart hook); works even in the
-     agents panel, no channel flag
+   - `claude-hook` — turn-boundary (Stop/SessionStart hook); works in the agents
+     panel with no channel flag, and *registers the identity* for dispatched agents
    - *(future)* `gemini-a2a`, … — independent, can run alongside the Claude ones
+
+Routing keys on the stable **id**; the **name** is just a mutable label — so you
+can rename a session after it's started (`set_name`) with zero message migration.
 
 ```mermaid
 flowchart LR
@@ -33,10 +38,10 @@ flowchart LR
         C2["claude"]
         DLV2["delivery<br/>(channel / hook)"]
     end
-    DB[("CORE — bus.db (SQLite)<br/>peers · messages")]
+    DB[("CORE — bus.db (SQLite)<br/>identities · names · messages")]
 
     C1 -- "send_message" --> SEND1
-    SEND1 -- "INSERT (enqueue)" --> DB
+    SEND1 -- "resolve name→id, INSERT" --> DB
     SEND1 -. "wake" .-> DLV2
     DB -- "pending rows" --> DLV2
     DLV2 -- "&lt;channel&gt; into session" --> C2
@@ -108,24 +113,50 @@ Now ask `frontend`: *"send_message to backend: what's the API contract?"* —
 `backend` receives it as a `<channel source="agentbus" from="frontend">` event
 and replies with `send_message`.
 
-You can also send straight from a shell (no MCP needed) — handy in scripts or a
-hook-only session:
+You can also drive the bus straight from a shell (no MCP needed) — handy in
+scripts and for dispatched agents:
 
 ```bash
 AGENTBUS_NAME=frontend bun run agentbus send backend "what's the API contract?"
+bun run agentbus name api      # (re)claim a name for this session
 bun run agentbus peers
 ```
 
 See [`examples/two-sessions.md`](examples/two-sessions.md) for a full walkthrough.
 
+## Identity & rename
+
+Each session has a stable **id** `<runtime>:<token>` (token = `AGENTBUS_NAME`, or
+the runtime's session id). Messages are keyed by id; a **name** is a mutable
+label that maps to it. So you can **rename after a session has started** —
+`set_name newname` (tool) or `agentbus name newname` (CLI) — and nothing
+migrates, because routing was never by name. Claiming a name someone else holds
+takes it over (they're notified).
+
+## Using `claude agents`
+
+Dispatched/background sessions can't take the channel flag, but the **hook**
+delivery works there — and it registers the agent's identity from the
+`session_id` it gets, so you don't need to set any env. Apply your user settings
+(which carry the hook) and the send tools to dispatched sessions:
+
+```bash
+claude agents --setting-sources user --mcp-config <agentbus-mcp-config>
+```
+
+A dispatched agent sends/names itself by shelling out via its Bash tool
+(`agentbus send …` / `agentbus name …`) — Bash subprocesses get
+`CLAUDE_SESSION_ID`, so the CLI computes the **same** id the hook registered.
+
 ## Tools (from the `agentbus` send server)
 
 | Tool | Args | Description |
 |------|------|-------------|
-| `send_message` | `to`, `text` | Message one peer by name |
+| `send_message` | `to`, `text` | Message one peer by name (resolved to its id) |
 | `broadcast` | `text` | Message every other online peer |
 | `list_peers` | — | Sessions currently online |
-| `whoami` | — | This session's name |
+| `whoami` | — | This session's name and id |
+| `set_name` | `name` | (Re)claim a name for this session |
 
 Incoming messages arrive (via your chosen delivery) as:
 
@@ -139,11 +170,14 @@ To reply, call `send_message` with `to` set to the `from` value.
 
 ## How it works
 
-- **Discovery** — a participating session (one with `AGENTBUS_NAME` set) upserts a
-  `peers` row and refreshes `last_seen`. A peer silent for 45s is reaped.
-- **Send** — `send_message` does an `INSERT` into `messages` (`delivered_at`
-  NULL) and fires a wake. Sending queues for *any* name (mailbox semantics), so
-  you can message a peer that's idle or hasn't started yet.
+- **Registry** — a participating session registers an `identities` row (id +
+  live `session_id`) and refreshes `last_seen`; a name maps to that id. A peer
+  silent for 45s is reaped. Registration is done by the send server (named
+  session) or the hook (dispatched agent) — not by each delivery.
+- **Send** — `send_message` resolves `name → id`, `INSERT`s into `messages`
+  (`recipient = id`, `delivered_at` NULL), and fires a wake. Sending queues for
+  *any* id (mailbox semantics), so you can message a peer that's idle or hasn't
+  started yet.
 - **Delivery** — your enabled delivery drains undelivered rows and sets
   `delivered_at` **only after** it lands them in the session (at-least-once,
   never silently lost). `claude-channel` does it in real time on a file-watch
@@ -189,8 +223,9 @@ world-writable location, and be deliberate about combining it with
 ## Project layout
 
 ```
-core/schema.ts                  Drizzle tables (peers, messages)
-core/bus.ts                     the bus: SQLite client + migrations + queries
+core/schema.ts                  Drizzle tables (identities, names, messages)
+core/bus.ts                     the bus + registry: SQLite client, migrations, queries
+core/identity.ts                id resolution (<runtime>:<token>) + name sanitizing
 core/ports.ts                   the standard: Envelope, Trigger, Delivery
 core/paths.ts                   where the bus lives (~/.agentbus)
 triggers/file-watch.ts          wake-file Trigger (default, event-driven)

@@ -25,6 +25,7 @@ import { homedir } from 'os'
 import { styleText } from 'node:util'
 import { DB_PATH, WAKE_DIR, HOME } from './core/paths'
 import { openBus } from './core/bus'
+import { resolveId, idKey, sanitizeName } from './core/identity'
 import { fileWatchTrigger } from './triggers/file-watch'
 
 const REPO = import.meta.dir
@@ -198,12 +199,16 @@ function cmdDoctor(): void {
   const db = new Database(DB_PATH, { readonly: true })
   try {
     const now = Date.now()
-    const peers = db.query('SELECT name, pid, last_seen FROM peers ORDER BY name').all() as any[]
-    console.log('  live peers:')
-    if (!peers.length) console.log(C.dim('    (none)'))
-    for (const p of peers) {
-      const state = p.last_seen >= now - 45_000 ? C.green('online') : C.dim('stale')
-      console.log(`    - ${p.name} (pid ${p.pid})  ${state}`)
+    const rows = db.query(
+      `SELECT i.id, i.session_id, i.last_seen, (SELECT group_concat(n.name, ', ') FROM names n WHERE n.id = i.id) AS names
+       FROM identities i ORDER BY i.id`,
+    ).all() as any[]
+    console.log('  identities:')
+    if (!rows.length) console.log(C.dim('    (none)'))
+    for (const r of rows) {
+      const state = r.last_seen >= now - 45_000 ? C.green('online') : C.dim('stale')
+      const sess = r.session_id ? C.dim(` session=${r.session_id}`) : ''
+      console.log(`    - ${r.names ?? C.dim('(no name)')}  ${C.dim(r.id)}  ${state}${sess}`)
     }
     const box = db.query(
       'SELECT recipient, sum(delivered_at IS NULL) pending, sum(delivered_at IS NOT NULL) delivered FROM messages GROUP BY recipient ORDER BY recipient',
@@ -214,19 +219,31 @@ function cmdDoctor(): void {
   } finally { db.close() }
 }
 
-// Send / list straight over the bus — no MCP server needed. Handy for scripts
-// and for hook-only sessions, which can shell out to this to send a reply.
-const sanitize = (s: string) => s.toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32)
-
+// Send / name / list straight over the bus — no MCP server needed. Handy for
+// scripts and for dispatched agents, which shell out to this (Bash subprocesses
+// get CLAUDE_SESSION_ID, so the id resolves the same as the hook's).
 function cmdSend(to: string, message: string): void {
-  const target = sanitize(to)
-  if (!target || !message) { console.error('usage: agentbus send <to> "message"'); process.exit(1) }
-  const from = sanitize(process.env.AGENTBUS_NAME ?? '') || 'cli'
+  if (!to || !message) { console.error('usage: agentbus send <to> "message"'); process.exit(1) }
   const bus = openBus(DB_PATH)
-  const id = bus.enqueue(from, target, message)
+  const toId = bus.idForName(sanitizeName(to)) ?? (to.includes(':') ? to : null)
+  if (!toId) { bus.close(); console.error(C.red(`no peer named "${to}"`)); process.exit(1) }
+  const from = resolveId('claude') ?? 'anon'
+  const id = bus.enqueue(from, toId, message)
   bus.close()
-  fileWatchTrigger(WAKE_DIR).notify(target) // wake a live channel receiver now
-  console.log(C.green('✓ sent') + C.dim(` ${from} → ${target} (#${id})`))
+  fileWatchTrigger(WAKE_DIR).notify(idKey(toId)) // wake a live delivery now
+  console.log(C.green('✓ sent') + C.dim(` ${from} → ${to} (#${id})`))
+}
+
+function cmdName(name: string): void {
+  const myId = resolveId('claude')
+  if (!myId) { console.error(C.red('no id — set AGENTBUS_NAME, or run inside a session (CLAUDE_SESSION_ID)')); process.exit(1) }
+  const clean = sanitizeName(name)
+  if (!clean) { console.error(C.red('name must contain a-z, 0-9, _ or -')); process.exit(1) }
+  const bus = openBus(DB_PATH)
+  bus.registerIdentity(myId, process.env.CLAUDE_SESSION_ID ?? null, process.pid)
+  bus.setName(clean, myId)
+  bus.close()
+  console.log(C.green(`✓ registered as ${clean}`) + C.dim(` (${myId})`))
 }
 
 function cmdPeers(): void {
@@ -260,6 +277,7 @@ usage:
   agentbus disable <delivery>      turn off a delivery
   agentbus launch <delivery> [name]  print the command to start a session
   agentbus send <to> "message"     enqueue a message over the bus (no MCP needed)
+  agentbus name <name>             claim a name for this session (over the bus)
   agentbus peers                   list peers currently online
   agentbus doctor                  diagnose runtime, registration, peers, mailboxes
   agentbus uninstall               remove send + every delivery + the bus`)
@@ -273,6 +291,7 @@ switch (cmd) {
   case 'disable': if (!a1) { usage(); process.exit(1) } disable(a1); break
   case 'launch': if (!a1) { usage(); process.exit(1) } cmdLaunch(a1, a2); break
   case 'send': if (!a1) { usage(); process.exit(1) } cmdSend(a1, process.argv.slice(4).join(' ')); break
+  case 'name': if (!a1) { usage(); process.exit(1) } cmdName(a1); break
   case 'peers': cmdPeers(); break
   case 'doctor': cmdDoctor(); break
   case 'uninstall': cmdUninstall(); break
