@@ -20,10 +20,9 @@ agentbus is a few clean layers (see **[SPEC.md](SPEC.md)**):
    MCP. Never drains. For a named session it also registers its identity.
 3. **delivery — pluggable, you pick.** How messages land *in* a session.
    Enable individually:
-   - `claude-channel` — real-time, mid-turn (file-watch + MCP channel push)
-   - `claude-hook` — turn-boundary (Stop/SessionStart hook); works in the agents
-     panel with no channel flag, and *registers the identity* for dispatched agents
-   - *(future)* `gemini-a2a`, … — independent, can run alongside the Claude ones
+   - `claude-channel` — real-time, mid-turn (file-watch + MCP channel push);
+     launch the session with `--dangerously-load-development-channels server:agentbus-channel`
+   - *(future)* `gemini-a2a`, `codex`, … — independent, can run alongside the Claude one
 
 Routing keys on the stable **id**; the **name** is just a mutable label — so you
 can rename a session after it's started (`set_name`) with zero message migration.
@@ -36,7 +35,7 @@ flowchart LR
     end
     subgraph S2["session: backend"]
         C2["claude"]
-        DLV2["delivery<br/>(channel / hook)"]
+        DLV2["delivery<br/>(channel)"]
     end
     DB[("CORE — bus.db (SQLite)<br/>identities · names · messages")]
 
@@ -79,7 +78,6 @@ the deliveries. Turn on the one(s) you want:
 
 ```bash
 bun run agentbus enable claude-channel   # real-time
-bun run agentbus enable claude-hook      # turn-boundary; works in the agents panel
 bun run agentbus list                    # what's on
 bun run agentbus disable claude-channel
 ```
@@ -92,19 +90,18 @@ There's intentionally **no "enable all"** — pick each delivery deliberately.
 bun run uninstall            # remove the send server + every delivery + the bus
 ```
 
-Restart any running session to fully drop the loaded server/hook. The cloned
+Restart any running session to fully drop the loaded server. The cloned
 repo is left in place.
 
 ## Use
 
-Give each session a name with `AGENTBUS_NAME`. Launch depends on the delivery:
+Give each session a name with `AGENTBUS_NAME`, and launch it with the channel
+flag so the delivery can reach it:
 
 ```bash
 # claude-channel (real-time): load the channel
 AGENTBUS_NAME=frontend claude --dangerously-load-development-channels server:agentbus-channel
-
-# claude-hook (turn-boundary): no flag needed
-AGENTBUS_NAME=backend claude
+AGENTBUS_NAME=backend  claude --dangerously-load-development-channels server:agentbus-channel
 ```
 
 (`bun run agentbus launch claude-channel frontend` prints the exact command.)
@@ -133,20 +130,22 @@ label that maps to it. So you can **rename after a session has started** —
 migrates, because routing was never by name. Claiming a name someone else holds
 takes it over (they're notified).
 
-## Using `claude agents`
+## Panel / background sessions
 
-Dispatched/background sessions can't take the channel flag, but the **hook**
-delivery works there — and it registers the agent's identity from the
-`session_id` it gets, so you don't need to set any env. Apply your user settings
-(which carry the hook) and the send tools to dispatched sessions:
+A delivery can only push *into* a session that loaded the channel. Sessions
+dispatched from the agents panel (or otherwise started without the
+`--dangerously-load-development-channels server:agentbus-channel` flag) **can't
+receive** — there's no transport into them. The supported path is to start the
+agent as a normal `claude` with the channel flag and a name:
 
 ```bash
-claude agents --setting-sources user --mcp-config <agentbus-mcp-config>
+AGENTBUS_NAME=worker claude --dangerously-load-development-channels server:agentbus-channel --mcp-config <agentbus-mcp-config>
 ```
 
-A dispatched agent sends/names itself by shelling out via its Bash tool
+Such a session can still *send* by shelling out via its Bash tool
 (`agentbus send …` / `agentbus name …`) — Bash subprocesses get
-`CLAUDE_SESSION_ID`, so the CLI computes the **same** id the hook registered.
+`CLAUDE_SESSION_ID`, so the CLI computes the same id — but to be messaged back it
+must be running the channel.
 
 ## Tools (from the `agentbus` send server)
 
@@ -173,7 +172,7 @@ To reply, call `send_message` with `to` set to the `from` value.
 - **Registry** — a participating session registers an `identities` row (id +
   live `session_id`) and refreshes `last_seen`; a name maps to that id. A peer
   silent for 45s is reaped. Registration is done by the send server (named
-  session) or the hook (dispatched agent) — not by each delivery.
+  session) — not by each delivery.
 - **Send** — `send_message` resolves `name → id`, `INSERT`s into `messages`
   (`recipient = id`, `delivered_at` NULL), and fires a wake. Sending queues for
   *any* id (mailbox semantics), so you can message a peer that's idle or hasn't
@@ -181,7 +180,7 @@ To reply, call `send_message` with `to` set to the `from` value.
 - **Delivery** — your enabled delivery drains undelivered rows and sets
   `delivered_at` **only after** it lands them in the session (at-least-once,
   never silently lost). `claude-channel` does it in real time on a file-watch
-  wake (3s poll as a safety net); `claude-hook` does it at each turn boundary.
+  wake (3s poll as a safety net).
 - **Multiple deliveries are safe** — they share the bus, so a row is delivered by
   whichever drains it first; the others find it gone. Duplicates (rare races) are
   deduped on `msg_id`.
@@ -233,8 +232,7 @@ triggers/poll.ts                interval Trigger (fallback)
 adapters/send.ts                the always-on MCP send server ("agentbus")
 adapters/send.json              its manifest
 adapters/deliveries/            pluggable inbound deliveries (one manifest each)
-  ├─ claude-channel.ts/.json    MCP channel server (file-watch + channel push)
-  └─ claude-hook.ts/.json       Stop/SessionStart hook (additionalContext)
+  └─ claude-channel.ts/.json    MCP channel server (file-watch + channel push)
 drizzle/                        generated, versioned SQL migrations
 cli.ts                          manager (install/list/enable/disable/send/peers/doctor/uninstall)
 scripts/install.sh              bootstrap: deps + register send + list deliveries
@@ -250,7 +248,7 @@ SPEC.md                         the agentbus standard
 for Claude Code over a shared SQLite store, and
 [session-bridge](https://blog.shreyaspatil.dev/session-bridge-i-made-two-claude-code-sessions-talk-to-each-other/)
 does it with a file mailbox. agentbus keeps the local-SQLite idea, separates an
-always-on MCP send layer from pluggable deliveries (channel, hook, …), and tracks
+always-on MCP send layer from pluggable deliveries (channel, …), and tracks
 delivery so messages are never silently lost.
 
 ## License

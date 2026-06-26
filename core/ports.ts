@@ -6,11 +6,9 @@
  * driven ports:
  *
  *   - Delivery (PUSH): how a message enters a runtime's live session.
- *       claude `channel` mode → an MCP `notifications/claude/channel`;
- *       claude `hook` mode → a hook's `additionalContext` output.
+ *       claude `channel` mode → an MCP `notifications/claude/channel`.
  *   - Trigger  (PULL): how a recipient learns it has mail to drain.
- *       file-watch nudges via a wake file; poll ticks on an interval;
- *       the hook mode is woken by the Claude Code lifecycle instead.
+ *       file-watch nudges via a wake file; poll ticks on an interval.
  *
  * See SPEC.md for the full standard.
  */

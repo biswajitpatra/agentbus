@@ -23,12 +23,12 @@ CI runs typecheck + tests on every push and PR; keep both green.
 - `triggers/` — Trigger (PULL) implementations: `file-watch`, `poll`.
 - `adapters/send.ts` (+ `send.json`) — the always-on MCP send server.
 - `adapters/deliveries/` — one `.ts` + `.json` per pluggable delivery
-  (`claude-channel`, `claude-hook`).
+  (`claude-channel`).
 - `cli.ts` — the manager (`install`/`list`/`enable`/`disable`/`send`/`peers`/
   `doctor`/`uninstall`).
 - `drizzle/` — generated, versioned SQL migrations (committed).
 - `test/` — spawns real send/delivery processes over stdio and asserts
-  discovery, delivery, offline queueing, no-loss under concurrency, and the hook.
+  discovery, delivery, offline queueing, and no-loss under concurrency.
 
 See [SPEC.md](SPEC.md) for the full standard and [README](README.md) for the
 bus design.
@@ -36,8 +36,7 @@ bus design.
 ## Adding a delivery
 
 1. Create `adapters/deliveries/<id>.ts` that opens the core bus and wires a
-   `Trigger` + a `Delivery` (see `claude-channel.ts` for a long-running server,
-   `claude-hook.ts` for a runtime-invoked script).
+   `Trigger` + a `Delivery` (see `claude-channel.ts` for a long-running server).
 2. Add `adapters/deliveries/<id>.json` (see [SPEC.md §7](SPEC.md)).
 3. If it needs a new install mechanism, add a `register.kind` handler in `cli.ts`.
 4. Keep the core untouched — deliveries depend on the core, never the reverse.

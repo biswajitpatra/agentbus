@@ -37,7 +37,7 @@ Layers:
   (waking a recipient). MCP is universal, so the same send layer works on any
   MCP-capable CLI. It **never drains** the inbox. For a *named* session it also
   registers its identity (registration is a concern of the registry, invoked by
-  whoever can establish the id — the send server, or the hook for agents).
+  whoever can establish the id — the send server).
 - **delivery** — how an envelope lands *in* a session, implemented with the two
   driven ports below (`Trigger` + `Delivery`). Deliveries are **pluggable and
   independent**: enable any combination, each individually (there is no
@@ -46,10 +46,10 @@ Layers:
   running several together is safe. Different runtimes' deliveries (Claude,
   Gemini, …) coexist on the one shared bus and can message each other.
 
-The Claude Code deliveries are `claude-channel` (file-watch + MCP channel —
-real-time) and `claude-hook` (hook lifecycle + `additionalContext` —
-turn-boundary, and works for sessions that can't load channels, e.g. ones
-dispatched from the agents panel).
+The Claude Code delivery is `claude-channel` (file-watch + MCP channel —
+real-time; the session is launched with `--dangerously-load-development-channels
+server:agentbus-channel`). Other runtimes plug in as new deliveries (`gemini-a2a`,
+`codex`, … — future).
 
 ## 2. Envelope
 
@@ -88,10 +88,9 @@ interface Trigger {
   delivery until the next `onWake`. **Implementations SHOULD pair a primary
   Trigger with a slow safety poll.**
 
-Reference implementations: `file-watch` (per-peer wake file + `fs.watch`),
-`poll` (fixed interval), and the host runtime's **hook lifecycle** (the claude
-`hook` mode arms on `SessionStart`/`Stop` — the runtime triggers the drain
-instead of a file watch, so there is no long-running process).
+Reference implementations: `file-watch` (per-peer wake file + `fs.watch`) and
+`poll` (fixed interval). `claude-channel` pairs `file-watch` as its primary
+Trigger with a slow `poll` as the safety net.
 
 ## 4. Port: Delivery (PUSH)
 
@@ -108,9 +107,8 @@ interface Delivery {
   by the agent**. Channels (and most push transports) provide no application
   ack, so "delivered" is a transport fact, not a read receipt.
 
-Reference implementations: `mcp-channel` (an MCP `notifications/claude/channel`
-— push, mid-turn) and `hook-additionalContext` (a Claude Code hook prints
-`hookSpecificOutput.additionalContext` — pull, at the turn boundary).
+Reference implementation: `mcp-channel` (an MCP `notifications/claude/channel`
+— push, mid-turn).
 
 ## 5. Delivery semantics
 
@@ -131,18 +129,16 @@ The registry is the part of core that answers "who is who," kept separate from
 delivery.
 
 **Identity.** `id = <runtime>:<token>`, where `token` is the first available of
-`AGENTBUS_NAME` (named interactive session), `CLAUDE_SESSION_ID` (Bash-tool
-subprocesses, so the CLI resolves the same id), or a runtime session id the
-delivery supplies (the hook reads `session_id` from stdin for dispatched agents,
-where no env can be set). Every component resolves the id the same way, so they
-agree. The `identities` row also carries the runtime's live `session_id`
-(stamped by the delivery), giving a bidirectional **id ↔ session-thread** link
-that survives the runtime reusing/rotating its own session id.
+`AGENTBUS_NAME` (named interactive session) or `CLAUDE_SESSION_ID` (Bash-tool
+subprocesses, so the CLI resolves the same id). Every component resolves the id
+the same way, so they agree. The `identities` row also carries the runtime's live
+`session_id` (stamped by the delivery), giving a bidirectional **id ↔
+session-thread** link that survives the runtime reusing/rotating its own session id.
 
-**Registration** happens wherever the id can be established — the send server
-for a named session, the hook for a dispatched agent — *not* in each delivery.
-It upserts the identity and refreshes `lastSeen` on a heartbeat (reference: 15 s,
-or per-turn for the hook). Silent past a stale window (45 s) ⇒ reaped.
+**Registration** happens wherever the id can be established — the send server for
+a named session — *not* in each delivery. It upserts the identity and refreshes
+`lastSeen` on a heartbeat (reference: 15 s). Silent past a stale window (45 s) ⇒
+reaped.
 
 **Names** are a mutable `name → id` map; `name` is unique. `set_name`/
 `register_name` claims a name for your id — re-registering an existing name
@@ -183,9 +179,8 @@ Each pluggable delivery is one file under `adapters/deliveries/`:
 `agentbus enable <delivery>` turns on exactly one delivery (and ensures `send` is
 registered); there is deliberately **no "enable all"**. `register.kind` tells the
 manager how to install it: `claude-mcp-server` writes an MCP server to
-`~/.claude.json`; `claude-hook` writes `SessionStart`/`Stop` hooks to
-`~/.claude/settings.json`. New kinds are added as new runtimes/transports are
-supported (e.g. an A2A delivery POSTing to a webhook).
+`~/.claude.json`. New kinds are added as new runtimes/transports are supported
+(e.g. an A2A delivery POSTing to a webhook).
 
 ## 8. Conformance
 

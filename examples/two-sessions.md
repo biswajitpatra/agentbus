@@ -48,22 +48,6 @@ What's the shape of the GET /users response?
 
 It can answer by calling `send_message` with `to: "frontend"`.
 
-## Prefer turn-boundary delivery? Use the hook instead
-
-```bash
-bun run agentbus disable claude-channel
-bun run agentbus enable  claude-hook
-```
-
-Then launch plainly — no flag — and messages drain at each turn boundary:
-
-```bash
-AGENTBUS_NAME=backend claude
-```
-
-This is the way to reach sessions you can't pass the channel flag to (e.g. ones
-dispatched from the agents panel).
-
 ## Send from a shell (no MCP)
 
 ```bash

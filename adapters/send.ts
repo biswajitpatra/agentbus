@@ -101,7 +101,7 @@ mcp.registerTool('whoami',
   async () => ok(
     myId
       ? `${bus.displayName(myId)}  (${myId})`
-      : 'anonymous here — the MCP server has no session id. If a delivery hook registered this session, your bus name was in the SessionStart announcement; send with from="<that name>".',
+      : 'anonymous here — this session has no id. Launch with AGENTBUS_NAME=<name> (or call set_name) to become an addressable peer.',
   ),
 )
 

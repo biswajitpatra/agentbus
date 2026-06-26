@@ -7,8 +7,8 @@
  *   - send (MCP): the always-on `agentbus` MCP server — send_message/list_peers/…
  *                 Universal: every CLI speaks MCP. This CLI keeps it registered.
  *   - delivery  : how messages land IN a session. Pluggable, multi-select —
- *                 claude-channel (file-watch + channel), claude-hook (Stop/
- *                 SessionStart), gemini-a2a (future). Enable any combination.
+ *                 claude-channel (file-watch + real-time channel), gemini-a2a
+ *                 (future). Enable any combination.
  *
  *   agentbus install                 register send + show deliveries
  *   agentbus list                    send + deliveries, and which are on
@@ -32,9 +32,8 @@ const REPO = import.meta.dir
 const DELIVERIES_DIR = join(REPO, 'adapters', 'deliveries')
 const SEND_MANIFEST = join(REPO, 'adapters', 'send.json')
 const CLAUDE_JSON = join(homedir(), '.claude.json')
-const SETTINGS_JSON = join(homedir(), '.claude', 'settings.json')
 
-type Register = { kind: string; name?: string; events?: string[] }
+type Register = { kind: string; name?: string }
 type Unit = { id: string; title: string; runtime: string; entry: string; register: Register; launch?: string; always?: boolean }
 
 const C = {
@@ -70,19 +69,12 @@ function writeJson(path: string, d: any): void {
   if (existsSync(path)) copyFileSync(path, `${path}.bak-agentbus`)
   writeFileSync(path, JSON.stringify(d, null, 2))
 }
-const hookCommand = (u: Unit) => `bun ${join(REPO, u.entry)}`
 
 // --- registration (dispatch by register.kind) --------------------------------
 
 function isEnabled(u: Unit): boolean {
   if (u.register.kind === 'claude-mcp-server') {
     return Boolean(readJson(CLAUDE_JSON).mcpServers?.[u.register.name!])
-  }
-  if (u.register.kind === 'claude-hook') {
-    const cmd = hookCommand(u)
-    const hooks = readJson(SETTINGS_JSON).hooks ?? {}
-    return Object.values(hooks).some((arr: any) =>
-      (arr as any[]).some(g => (g.hooks ?? []).some((h: any) => h.command === cmd)))
   }
   return false
 }
@@ -92,16 +84,6 @@ function registerUnit(u: Unit): void {
     const d = readJson(CLAUDE_JSON)
     ;(d.mcpServers ??= {})[u.register.name!] = { command: 'bun', args: [join(REPO, u.entry)] }
     writeJson(CLAUDE_JSON, d)
-  } else if (u.register.kind === 'claude-hook') {
-    const d = readJson(SETTINGS_JSON)
-    const cmd = hookCommand(u)
-    d.hooks ??= {}
-    for (const ev of u.register.events ?? []) {
-      d.hooks[ev] ??= []
-      const present = (d.hooks[ev] as any[]).some(g => (g.hooks ?? []).some((h: any) => h.command === cmd))
-      if (!present) d.hooks[ev].push({ hooks: [{ type: 'command', command: cmd }] })
-    }
-    writeJson(SETTINGS_JSON, d)
   } else {
     console.error(C.red(`don't know how to register kind "${u.register.kind}" yet`)); process.exit(1)
   }
@@ -114,26 +96,10 @@ function unregisterUnit(u: Unit): boolean {
     if (had) { delete d.mcpServers[u.register.name!]; writeJson(CLAUDE_JSON, d) }
     return had
   }
-  if (u.register.kind === 'claude-hook') {
-    const d = readJson(SETTINGS_JSON)
-    const cmd = hookCommand(u)
-    let had = false
-    for (const ev of Object.keys(d.hooks ?? {})) {
-      const before = (d.hooks[ev] as any[]).length
-      d.hooks[ev] = (d.hooks[ev] as any[]).filter(g => !(g.hooks ?? []).some((h: any) => h.command === cmd))
-      if (d.hooks[ev].length !== before) had = true
-      if (!d.hooks[ev].length) delete d.hooks[ev]
-    }
-    if (had) writeJson(SETTINGS_JSON, d)
-    return had
-  }
   return false
 }
 
-const whereOf = (u: Unit) =>
-  u.register.kind === 'claude-hook'
-    ? `${(u.register.events ?? []).join('/')} hooks in ~/.claude/settings.json`
-    : `MCP server "${u.register.name}" in ~/.claude.json`
+const whereOf = (u: Unit) => `MCP server "${u.register.name}" in ~/.claude.json`
 
 function ensureSend(): void {
   const s = send()
@@ -221,7 +187,7 @@ function cmdDoctor(): void {
 
 // Send / name / list straight over the bus — no MCP server needed. Handy for
 // scripts and for dispatched agents, which shell out to this (Bash subprocesses
-// get CLAUDE_SESSION_ID, so the id resolves the same as the hook's).
+// get CLAUDE_SESSION_ID, so the id resolves the same as the send server's).
 function cmdSend(to: string, message: string): void {
   if (!to || !message) { console.error('usage: agentbus send <to> "message"'); process.exit(1) }
   const bus = openBus(DB_PATH)
@@ -264,7 +230,7 @@ function cmdUninstall(): void {
   }
   try { rmSync(WAKE_DIR, { recursive: true, force: true }) } catch {}
   try { rmSync(HOME, { recursive: false }) } catch {} // only if now empty
-  console.log(C.green('\n✓ uninstalled') + C.dim(' — restart any running session to drop the loaded server/hook.'))
+  console.log(C.green('\n✓ uninstalled') + C.dim(' — restart any running session to drop the loaded server.'))
 }
 
 function usage(): void {
