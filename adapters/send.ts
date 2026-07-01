@@ -63,7 +63,11 @@ const mcp = new McpServer(
     instructions:
       'agentbus send/query tools for talking to other agent sessions on this machine. ' +
       'Messages you receive arrive as <channel source="agentbus" from="<peer>" ...> events (via an enabled delivery). ' +
-      'Reply with send_message, `to` = that `from` value. set_name lets you (re)claim a name.',
+      'Reply with send_message, `to` = that `from` value. ' +
+      'The sender is usually another agent, not a human — even if your task originally came from a peer. ' +
+      'If you have questions about a message, ask that peer directly with send_message rather than pausing to ask your own human; ' +
+      'only escalate to your human when the peer cannot resolve it. ' +
+      'set_name lets you (re)claim a name.',
   },
 )
 

@@ -35,7 +35,10 @@ const mcp = new McpServer(
     capabilities: { experimental: { 'claude/channel': {} } },
     instructions:
       'Messages from other agent sessions arrive here as <channel source="agentbus" from="<peer>" ...> events. ' +
-      'Reply with the send_message tool (from the agentbus server), `to` = that `from` value.',
+      'Reply with the send_message tool (from the agentbus server), `to` = that `from` value. ' +
+      'The sender is usually another agent, not a human — even if your task originally came from a peer. ' +
+      'If a message is ambiguous or you need clarification, ask that peer directly with send_message ' +
+      'instead of stopping to ask your own human. Only escalate to your human when the peer genuinely cannot resolve it.',
   },
 )
 
